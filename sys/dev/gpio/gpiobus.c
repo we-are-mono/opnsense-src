@@ -40,6 +40,10 @@
 #include <sys/sbuf.h>
 
 #include <dev/gpio/gpiobusvar.h>
+#ifdef FDT
+#include <dev/ofw/ofw_bus.h>
+#include <dev/ofw/ofw_bus_subr.h>
+#endif
 
 #include "gpiobus_if.h"
 
@@ -293,6 +297,53 @@ gpiobus_print_pins(struct gpiobus_ivar *devi, struct sbuf *sb)
 		sbuf_printf(sb, "%d", range_start);
 }
 
+#ifdef FDT
+/*
+ * Process a gpio-hog child node of a GPIO controller.
+ * Sets the pin direction and value as specified in the DT.
+ * The "gpios" property is controller-relative: <pin flags>.
+ * "output-high"/"output-low" are logical levels; GPIO_ACTIVE_LOW
+ * inverts the physical pin state.
+ */
+static void
+gpiobus_process_hog(device_t dev, phandle_t child)
+{
+	char name[64];
+	uint32_t gpiocells[2];
+	uint32_t pin;
+	int active_low, val;
+
+	if (OF_getencprop(child, "gpios", gpiocells, sizeof(gpiocells)) !=
+	    sizeof(gpiocells))
+		return;
+
+	pin = gpiocells[0];
+	active_low = (gpiocells[1] & 1);	/* bit 0 = GPIO_ACTIVE_LOW */
+
+	name[0] = '\0';
+	OF_getprop(child, "line-name", name, sizeof(name));
+	name[sizeof(name) - 1] = '\0';
+
+	if (OF_hasprop(child, "output-high")) {
+		val = active_low ? 0 : 1;
+		GPIO_PIN_SETFLAGS(dev, pin, GPIO_PIN_OUTPUT);
+		GPIO_PIN_SET(dev, pin, val);
+		device_printf(dev, "gpio-hog: pin %d (%s) "
+		    "output-high (phys=%d)\n", pin, name, val);
+	} else if (OF_hasprop(child, "output-low")) {
+		val = active_low ? 1 : 0;
+		GPIO_PIN_SETFLAGS(dev, pin, GPIO_PIN_OUTPUT);
+		GPIO_PIN_SET(dev, pin, val);
+		device_printf(dev, "gpio-hog: pin %d (%s) "
+		    "output-low (phys=%d)\n", pin, name, val);
+	} else if (OF_hasprop(child, "input")) {
+		GPIO_PIN_SETFLAGS(dev, pin, GPIO_PIN_INPUT);
+		device_printf(dev, "gpio-hog: pin %d (%s) input\n",
+		    pin, name);
+	}
+}
+#endif
+
 device_t
 gpiobus_attach_bus(device_t dev)
 {
@@ -307,6 +358,23 @@ gpiobus_attach_bus(device_t dev)
 	}
 #ifdef FDT
 	ofw_gpiobus_register_provider(dev);
+	/*
+	 * Process gpio-hog children before bus_generic_attach() so
+	 * that muxes, power enables, and other board signals are
+	 * configured before downstream devices (PCIe, UART) probe.
+	 */
+	{
+		phandle_t node, child;
+
+		node = ofw_bus_get_node(dev);
+		if (node > 0) {
+			for (child = OF_child(node); child != 0;
+			    child = OF_peer(child)) {
+				if (OF_hasprop(child, "gpio-hog"))
+					gpiobus_process_hog(dev, child);
+			}
+		}
+	}
 #endif
 	bus_generic_attach(dev);
 
