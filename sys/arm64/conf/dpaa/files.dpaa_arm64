@@ -123,3 +123,6 @@ dev/dpaa/if_dtsec_im.c				optional dpaa fdt	\
 	no-depend compile-with "${DPAA_COMPILE_CMD}"
 dev/dpaa/if_dtsec_rm.c				optional dpaa fdt	\
 	no-depend compile-with "${DPAA_COMPILE_CMD}"
+# Offline / Header Manipulation ports
+dev/dpaa/dpaa_oh.c				optional dpaa fdt	\
+	no-depend compile-with "${DPAA_COMPILE_CMD}"
