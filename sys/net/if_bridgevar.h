@@ -325,6 +325,18 @@ struct ifbpstpconf {
 extern	void (*bridge_dn_p)(struct mbuf *, struct ifnet *);
 extern	bool (*bridge_member_ifaddrs_p)(void);
 
+/*
+ * L2 flow offload hooks — set by auto_bridge.ko, called from
+ * bridge_forward() and bridge_rtage() respectively.
+ */
+typedef void (*bridge_l2flow_hook_t)(struct ifnet *bridge_ifp,
+    struct mbuf *m, struct ifnet *src_if, struct ifnet *dst_if);
+typedef int (*bridge_fdb_can_expire_hook_t)(const uint8_t *mac,
+    struct ifnet *bridge_ifp);
+
+extern	bridge_l2flow_hook_t bridge_l2flow_hook;
+extern	bridge_fdb_can_expire_hook_t bridge_fdb_can_expire_hook;
+
 #endif /* _KERNEL */
 
 #endif /* _NET_IF_BRIDGEVAR_H_ */
