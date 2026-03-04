@@ -94,6 +94,7 @@ static struct pca954x_descr pca9548_descr = {
 #ifdef FDT
 static struct ofw_compat_data compat_data[] = {
 	{ "nxp,pca9540", (uintptr_t)&pca9540_descr },
+	{ "nxp,pca9545", (uintptr_t)&pca9546_descr },
 	{ "nxp,pca9546", (uintptr_t)&pca9546_descr },
 	{ "nxp,pca9547", (uintptr_t)&pca9547_descr },
 	{ "nxp,pca9548", (uintptr_t)&pca9548_descr },

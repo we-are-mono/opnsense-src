@@ -678,6 +678,7 @@ static const char *random_source_descr[/*ENTROPYSOURCE*/] = {
 	[RANDOM_PURE_SAFE] = "PURE_SAFE",
 	[RANDOM_PURE_GLXSB] = "PURE_GLXSB",
 	[RANDOM_PURE_HIFN] = "PURE_HIFN",
+	[RANDOM_PURE_CAAM] = "PURE_CAAM",
 	/* "ENTROPYSOURCE" */
 };
 CTASSERT(nitems(random_source_descr) == ENTROPYSOURCE);
