@@ -35,7 +35,9 @@
 
 #include <machine/bus.h>
 
+#ifdef __powerpc__
 #include <powerpc/mpc85xx/mpc85xx.h>
+#endif
 
 #include <net/if.h>
 #include <net/if_media.h>
@@ -100,11 +102,11 @@ dtsec_fdt_probe(device_t dev)
 		return (ENXIO);
 
 	if (!ofw_bus_is_compatible(dev, "fsl,fman-dtsec") &&
-	    !ofw_bus_is_compatible(dev, "fsl,fman-xgec"))
+	    !ofw_bus_is_compatible(dev, "fsl,fman-xgec") &&
+	    !ofw_bus_is_compatible(dev, "fsl,fman-memac"))
 		return (ENXIO);
 
-	device_set_desc(dev, "Freescale Data Path Triple Speed Ethernet "
-	    "Controller");
+	device_set_desc(dev, "Freescale Data Path Ethernet Controller");
 
 	return (BUS_PROBE_DEFAULT);
 }
@@ -116,7 +118,7 @@ dtsec_fdt_attach(device_t dev)
 	device_t phy_dev;
 	phandle_t enet_node, phy_node;
 	phandle_t fman_rxtx_node[2];
-	char phy_type[6];
+	char phy_type[16];
 	pcell_t fman_tx_cell, mac_id;
 	int rid;
 
@@ -130,26 +132,47 @@ dtsec_fdt_attach(device_t dev)
 		return (ENXIO);
 	}
 
-	/* Get link speed */
-	if (ofw_bus_is_compatible(dev, "fsl,fman-dtsec") != 0)
+	/* Determine MAC type / link speed */
+	if (ofw_bus_is_compatible(dev, "fsl,fman-memac") != 0) {
+		/* mEMAC: detect 10G from phy-connection-type */
+		if (OF_getprop(enet_node, "phy-connection-type",
+		    (void *)phy_type, sizeof(phy_type)) > 0 &&
+		    (!strcmp(phy_type, "xgmii") ||
+		     !strcmp(phy_type, "10gbase-r")))
+			sc->sc_eth_dev_type = ETH_10GSEC;
+		else
+			sc->sc_eth_dev_type = ETH_DTSEC;
+	} else if (ofw_bus_is_compatible(dev, "fsl,fman-dtsec") != 0)
 		sc->sc_eth_dev_type = ETH_DTSEC;
 	else if (ofw_bus_is_compatible(dev, "fsl,fman-xgec") != 0)
 		sc->sc_eth_dev_type = ETH_10GSEC;
-	else
+	else {
+		device_printf(dev, "unknown MAC compatible\n");
 		return(ENXIO);
+	}
 
 	/* Get PHY address */
-	if (OF_getprop(enet_node, "phy-handle", (void *)&phy_node,
-	    sizeof(phy_node)) <= 0)
+	if (OF_getencprop(enet_node, "phy-handle", (void *)&phy_node,
+	    sizeof(phy_node)) <= 0) {
+		/* 10G ports may use managed="in-band-status" with no PHY */
+		if (sc->sc_eth_dev_type == ETH_10GSEC) {
+			sc->sc_phy_addr = -1;
+			sc->sc_mdio = NULL;
+			goto skip_phy;
+		}
+		device_printf(dev, "missing phy-handle\n");
 		return (ENXIO);
+	}
 
 	phy_node = OF_node_from_xref(phy_node);
 
-	if (OF_getprop(phy_node, "reg", (void *)&sc->sc_phy_addr,
-	    sizeof(sc->sc_phy_addr)) <= 0)
+	if (OF_getencprop(phy_node, "reg", (void *)&sc->sc_phy_addr,
+	    sizeof(sc->sc_phy_addr)) <= 0) {
+		device_printf(dev, "missing phy reg\n");
 		return (ENXIO);
+	}
 
-	phy_dev = OF_device_from_xref(OF_parent(phy_node));
+	phy_dev = OF_device_from_xref(OF_xref_from_node(OF_parent(phy_node)));
 
 	if (phy_dev == NULL) {
 		device_printf(dev, "No PHY found.\n");
@@ -157,68 +180,106 @@ dtsec_fdt_attach(device_t dev)
 	}
 
 	sc->sc_mdio = phy_dev;
+skip_phy:
 
 	/* Get MAC memory offset in SoC */
 	rid = 0;
 	sc->sc_mem = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
-	if (sc->sc_mem == NULL)
+	if (sc->sc_mem == NULL) {
+		device_printf(dev, "could not alloc memory resource\n");
 		return (ENXIO);
+	}
 
 	/* Get PHY connection type */
 	if (OF_getprop(enet_node, "phy-connection-type", (void *)phy_type,
-	    sizeof(phy_type)) <= 0)
+	    sizeof(phy_type)) <= 0) {
+		device_printf(dev, "missing phy-connection-type\n");
 		return (ENXIO);
+	}
 
 	if (!strcmp(phy_type, "sgmii"))
 		sc->sc_mac_enet_mode = e_ENET_MODE_SGMII_1000;
 	else if (!strcmp(phy_type, "rgmii"))
 		sc->sc_mac_enet_mode = e_ENET_MODE_RGMII_1000;
 	else if (!strcmp(phy_type, "xgmii"))
-		/* We set 10 Gigabit mode flag however we don't support it */
 		sc->sc_mac_enet_mode = e_ENET_MODE_XGMII_10000;
-	else
+	else if (!strcmp(phy_type, "10gbase-r"))
+		sc->sc_mac_enet_mode = e_ENET_MODE_XGMII_10000;
+	else {
+		device_printf(dev, "unsupported phy-connection-type: %s\n",
+		    phy_type);
 		return (ENXIO);
+	}
 
 	if (OF_getencprop(enet_node, "cell-index",
-	    (void *)&mac_id, sizeof(mac_id)) <= 0)
+	    (void *)&mac_id, sizeof(mac_id)) <= 0) {
+		device_printf(dev, "missing cell-index\n");
 		return (ENXIO);
+	}
 	sc->sc_eth_id = mac_id;
+	sc->sc_mac_cell_index = mac_id;
+	/* ncsw expects 0-based per-type MAC IDs: 0..5 for 1G, 0..1 for 10G.
+	 * FManV3 device trees use cell-index 0-5 for 1G MACs but 8-9 for
+	 * 10G MACs (hardware MEMAC slot numbering).  Remap to 0-based. */
+	if (sc->sc_eth_dev_type == ETH_10GSEC && mac_id >= 8)
+		sc->sc_eth_id = mac_id - 8;
 
 	/* Get RX/TX port handles */
-	if (OF_getprop(enet_node, "fsl,fman-ports", (void *)fman_rxtx_node,
-	    sizeof(fman_rxtx_node)) <= 0)
+	if (OF_getencprop(enet_node, "fsl,fman-ports", (void *)fman_rxtx_node,
+	    sizeof(fman_rxtx_node)) <= 0) {
+		device_printf(dev, "missing fsl,fman-ports\n");
 		return (ENXIO);
+	}
 
-	if (fman_rxtx_node[0] == 0)
+	if (fman_rxtx_node[0] == 0) {
+		device_printf(dev, "fsl,fman-ports[0] is zero\n");
 		return (ENXIO);
+	}
 
-	if (fman_rxtx_node[1] == 0)
+	if (fman_rxtx_node[1] == 0) {
+		device_printf(dev, "fsl,fman-ports[1] is zero\n");
 		return (ENXIO);
+	}
 
-	fman_rxtx_node[0] = OF_instance_to_package(fman_rxtx_node[0]);
-	fman_rxtx_node[1] = OF_instance_to_package(fman_rxtx_node[1]);
+	/* fsl,fman-ports are phandle references on ARM64, ihandles on PPC */
+	fman_rxtx_node[0] = OF_node_from_xref(fman_rxtx_node[0]);
+	fman_rxtx_node[1] = OF_node_from_xref(fman_rxtx_node[1]);
 
 	if (ofw_bus_node_is_compatible(fman_rxtx_node[0],
-	    "fsl,fman-v2-port-rx") == 0)
+	    "fsl,fman-v2-port-rx") == 0 &&
+	    ofw_bus_node_is_compatible(fman_rxtx_node[0],
+	    "fsl,fman-v3-port-rx") == 0) {
+		device_printf(dev, "RX port incompatible\n");
 		return (ENXIO);
+	}
 
 	if (ofw_bus_node_is_compatible(fman_rxtx_node[1],
-	    "fsl,fman-v2-port-tx") == 0)
+	    "fsl,fman-v2-port-tx") == 0 &&
+	    ofw_bus_node_is_compatible(fman_rxtx_node[1],
+	    "fsl,fman-v3-port-tx") == 0) {
+		device_printf(dev, "TX port incompatible\n");
 		return (ENXIO);
+	}
 
 	/* Get RX port HW id */
-	if (OF_getprop(fman_rxtx_node[0], "reg", (void *)&sc->sc_port_rx_hw_id,
-	    sizeof(sc->sc_port_rx_hw_id)) <= 0)
+	if (OF_getencprop(fman_rxtx_node[0], "reg", (void *)&sc->sc_port_rx_hw_id,
+	    sizeof(sc->sc_port_rx_hw_id)) <= 0) {
+		device_printf(dev, "missing RX port reg\n");
 		return (ENXIO);
+	}
 
 	/* Get TX port HW id */
-	if (OF_getprop(fman_rxtx_node[1], "reg", (void *)&sc->sc_port_tx_hw_id,
-	    sizeof(sc->sc_port_tx_hw_id)) <= 0)
+	if (OF_getencprop(fman_rxtx_node[1], "reg", (void *)&sc->sc_port_tx_hw_id,
+	    sizeof(sc->sc_port_tx_hw_id)) <= 0) {
+		device_printf(dev, "missing TX port reg\n");
 		return (ENXIO);
+	}
 
-	if (OF_getprop(fman_rxtx_node[1], "cell-index", &fman_tx_cell,
-	    sizeof(fman_tx_cell)) <= 0)
+	if (OF_getencprop(fman_rxtx_node[1], "cell-index", &fman_tx_cell,
+	    sizeof(fman_tx_cell)) <= 0) {
+		device_printf(dev, "missing TX port cell-index\n");
 		return (ENXIO);
+	}
 	/* Get QMan channel */
 	sc->sc_port_tx_qman_chan = fman_qman_channel_id(device_get_parent(dev),
 	    fman_tx_cell);

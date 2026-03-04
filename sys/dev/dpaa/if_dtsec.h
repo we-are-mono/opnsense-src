@@ -27,12 +27,17 @@
 #ifndef IF_DTSEC_H_
 #define IF_DTSEC_H_
 
+#include "opt_dpaa.h"
+
 /**
  * @group dTSEC common API.
  * @{
  */
 #define DTSEC_MODE_REGULAR		0
 #define DTSEC_MODE_INDEPENDENT		1
+
+#define DTSEC_TX_NUM_FQS		4	/* One per CPU (LS1046A quad-core) */
+#define DTSEC_RX_NUM_FQS		128	/* RSS hash distribution (power of 2) */
 
 #define DTSEC_LOCK(sc)			mtx_lock(&(sc)->sc_lock)
 #define DTSEC_UNLOCK(sc)		mtx_unlock(&(sc)->sc_lock)
@@ -65,6 +70,7 @@ struct dtsec_softc {
 	/* dTSEC data */
 	enum eth_dev_type		sc_eth_dev_type;
 	uint8_t				sc_eth_id; /* Ethernet ID within its frame manager */
+	uint8_t				sc_mac_cell_index; /* raw DT cell-index */
 	uintptr_t			sc_mac_mem_offset;
 	e_EnetMode			sc_mac_enet_mode;
 	int				sc_mac_mdio_irq;
@@ -97,20 +103,42 @@ struct dtsec_softc {
 	uint8_t				sc_rx_bpid;
 	uma_zone_t			sc_rx_zone;
 	char				sc_rx_zname[64];
+	uint32_t			sc_rx_buf_total; /* total buffers alloc'd from UMA */
 
-	/* RX Frame Queue */
-	t_Handle			sc_rx_fqr;
+	/* RX Frame Queues — RSS hash distribution via dedicated channels */
+	t_Handle			sc_rx_fqr[DTSEC_RX_NUM_FQS];
 	uint32_t			sc_rx_fqid;
 
-	/* TX Frame Queue */
-	t_Handle			sc_tx_fqr;
-	bool				sc_tx_fqr_full;
+	/* Per-CPU TX Frame Queues */
+	t_Handle			sc_tx_fqs[DTSEC_TX_NUM_FQS];
+	volatile int			sc_tx_inflight[DTSEC_TX_NUM_FQS];
+
+	/* TX Confirmation Frame Queue (single, on pool channel) */
 	t_Handle			sc_tx_conf_fqr;
 	uint32_t			sc_tx_conf_fqid;
 
 	/* Frame Info Zone */
 	uma_zone_t			sc_fi_zone;
 	char				sc_fi_zname[64];
+
+	/* TX buffer prefix data offset (from FM_PORT_GetBufferDataOffset) */
+	uint32_t			sc_tx_data_offset;
+
+	/* SG table buffer zone (prefix + SG entries) */
+	uma_zone_t			sc_sgt_zone;
+	char				sc_sgt_zname[64];
+	uint32_t			sc_sgt_buf_size;
+
+	/* PCD (Parse-Classify-Distribute) for RSS + RX checksum */
+	t_Handle			sc_pcdh;
+	t_Handle			sc_netenvh;
+	t_Handle			sc_scheme;
+	uint32_t			sc_rx_data_offset;
+	t_Handle			sc_vsph;	/* default VSP handle */
+
+	/* CEETM DSCP-based egress QoS (populated by CDX module) */
+	volatile int			sc_ceetm_en;
+	uint32_t			sc_ceetm_dscp_fqid[64];
 };
 /** @} */
 
@@ -124,7 +152,7 @@ enum dtsec_fm_port_params {
 	FM_PORT_LIODN_OFFSET 	= 0,
 	FM_PORT_MEM_ID		= 0,
 	FM_PORT_MEM_ATTR	= MEMORY_ATTR_CACHEABLE,
-	FM_PORT_BUFFER_SIZE	= MCLBYTES,
+	FM_PORT_BUFFER_SIZE	= (9600 + 64),	/* DTSEC_MAX_FRAME_SIZE + headroom */
 };
 
 e_FmPortType	dtsec_fm_port_rx_type(enum eth_dev_type type);
