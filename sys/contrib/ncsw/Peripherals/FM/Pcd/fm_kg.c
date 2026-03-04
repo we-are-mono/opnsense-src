@@ -1035,6 +1035,12 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
     memset(swDefaults, 0, NUM_OF_SW_DEFAULTS*sizeof(t_FmPcdKgExtractDflt));
     memset(p_SchemeRegs, 0, sizeof(struct fman_kg_scheme_regs));
 
+    /* Default: disable policer profile generation.  PLCR and
+     * CC-with-plcrNext cases below overwrite kgse_ppc when PGEN
+     * is actually needed.  Without this, kgse_ppc=0 leaves
+     * PP_NO_GEN clear → implicit PGEN with profile 0. */
+    p_SchemeRegs->kgse_ppc = KG_SCH_PP_NO_GEN;
+
     if (p_SchemeParams->netEnvParams.numOfDistinctionUnits > FM_PCD_MAX_NUM_OF_DISTINCTION_UNITS)
         RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                      ("numOfDistinctionUnits should not exceed %d", FM_PCD_MAX_NUM_OF_DISTINCTION_UNITS));
@@ -1250,7 +1256,13 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
     }
     p_SchemeRegs->kgse_mode = tmpReg;
 
-    p_SchemeRegs->kgse_mv = p_Scheme->matchVector;
+    /* SCHEME_ALWAYS_DIRECT (0xFFFFFFFF) means "match all frames" in NCSW
+     * software, but FMan KG hardware interprets the MV register literally:
+     * (classification_vector & kgse_mv) == kgse_mv.  With 0xFFFFFFFF, all
+     * 32 classification bits must be set — no frame can ever match.
+     * Write 0 instead: the hardware treats MV=0 as "always match." */
+    p_SchemeRegs->kgse_mv = (p_Scheme->matchVector == SCHEME_ALWAYS_DIRECT)
+        ? 0 : p_Scheme->matchVector;
 
 #if (DPAA_VERSION >= 11)
     if (p_SchemeParams->overrideStorageProfile)
@@ -1569,6 +1581,17 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
                 generic = FALSE;
             }
         }
+        /*
+         * CDX/ASK flow offload requires the port ID to always be
+         * present as the first byte of every KG key output.  The
+         * PCD XML <combine portid="true"> only adds it to
+         * extractedOrs (for FQID modification), but the CDX hash
+         * table key (union dpa_key) expects portid at byte 0.
+         * Force KG_SCH_KN_PORT_ID into the known-fields set so
+         * the hardware extracts it as known-field ID 0 (bit 31,
+         * highest priority → first in key output).
+         */
+        knownTmp |= KG_SCH_KN_PORT_ID;
         p_SchemeRegs->kgse_ekfc = knownTmp;
 
         selectTmp = 0;

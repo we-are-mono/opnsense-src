@@ -381,16 +381,23 @@ t_Error BmPortalRelease(t_Handle h_BmPortal,
     if (!r) {
         if (flags & BMAN_RELEASE_FLAG_WAIT) {
             t_Error ret = wait_rel_start(p_BmPortal, &r, flags);
-            if (ret)
+            if (ret) {
+                printf("BmPortalRelease: wait_rel_start FAILED E_BUSY, avail=%u, "
+                    "rcr.ci=%u, rcr.cursor=%p, rcr.vbit=%u\n",
+                    bm_rcr_get_avail(p_BmPortal->p_BmPortalLow),
+                    p_BmPortal->p_BmPortalLow->rcr.ci,
+                    p_BmPortal->p_BmPortalLow->rcr.cursor,
+                    p_BmPortal->p_BmPortalLow->rcr.vbit);
                 return ret;
+            }
         } else
             return ERROR_CODE(E_BUSY);
         ASSERT_COND(r != NULL);
     }
     r->bpid = bpid;
     for (i = 0; i < num; i++) {
-        r->bufs[i].hi = bufs[i].hi;
-        r->bufs[i].lo = bufs[i].lo;
+        WRITE_UINT16(r->bufs[i].hi, bufs[i].hi);
+        WRITE_UINT32(r->bufs[i].lo, bufs[i].lo);
     }
     /* Issue the release command and wait for sync if requested. NB: the
      * commit can't fail, only waiting can. Don't propagate any failure if a
@@ -423,8 +430,8 @@ uint8_t BmPortalAcquire(t_Handle h_BmPortal,
     ASSERT_COND(num <= 8);
     while (num--) {
         bufs[num].bpid = bpid;
-        bufs[num].hi = mcr->acquire.bufs[num].hi;
-        bufs[num].lo = mcr->acquire.bufs[num].lo;
+        bufs[num].hi = GET_UINT16(mcr->acquire.bufs[num].hi);
+        bufs[num].lo = GET_UINT32(mcr->acquire.bufs[num].lo);
     }
     PUNLOCK(p_BmPortal);
     return ret;
@@ -495,7 +502,7 @@ t_Handle BM_PORTAL_Config(t_BmPortalParam *p_BmPortalParam)
     p_BmPortal->h_Bm    = p_BmPortalParam->h_Bm;
 
     p_BmPortal->p_BmPortalDriverParams->hwExtStructsMemAttr     = DEFAULT_memAttr;
-    bman_depletion_fill(&p_BmPortal->p_BmPortalDriverParams->mask);
+    bman_depletion_init(&p_BmPortal->p_BmPortalDriverParams->mask);
 
     return p_BmPortal;
 }

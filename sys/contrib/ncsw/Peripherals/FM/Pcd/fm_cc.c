@@ -38,6 +38,7 @@
  *//***************************************************************************/
 #include <sys/cdefs.h>
 #include <sys/endian.h>
+
 #include "std_ext.h"
 #include "error_ext.h"
 #include "string_ext.h"
@@ -50,6 +51,15 @@
 #include "fm_hc.h"
 #include "fm_cc.h"
 #include "crc64.h"
+
+#ifdef USE_ENHANCED_EHASH
+#include "fm_ehash.h"
+extern t_Handle ExternalHashTableSet(t_Handle h_FmPcd,
+                                     t_FmPcdHashTableParams *p_Param);
+extern t_Error ExternalHashTableModifyMissNextEngine(t_Handle h_HashTbl,
+                                     t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
+extern void copy_td_to_ccbase(void *handle, t_Handle p_CcTreeTmp);
+#endif /* USE_ENHANCED_EHASH */
 
 /****************************************/
 /*       static functions               */
@@ -344,6 +354,24 @@ static void FillAdOfTypeContLookup(t_Handle h_Ad,
     /* if (p_AdNewPtr = NULL) --> Done. (case (3)) */
     if (p_AdNewPtr)
     {
+#if (DPAA_VERSION >= 11)
+        if (p_Node->externalHash)
+        {
+            /*
+             * External hash table (CDX): write a zeroed placeholder AD.
+             * CDX will overwrite this AD with its opcode-format entries
+             * when it takes over the hash table.  Until then, the zero
+             * AD acts as a "result" type with FQID=0 / NIA=0, which
+             * causes FMan to enqueue to the default queue.
+             */
+            WRITE_UINT32(p_AdContLookup->ccAdBase, 0);
+            WRITE_UINT32(p_AdContLookup->matchTblPtr, 0);
+            WRITE_UINT32(p_AdContLookup->pcAndOffsets, 0);
+            WRITE_UINT32(p_AdContLookup->gmask, 0);
+        }
+        else
+#endif /* (DPAA_VERSION >= 11) */
+        {
         /* cases (1) & (2) */
         tmpReg32 = 0;
         tmpReg32 |= FM_PCD_AD_CONT_LOOKUP_TYPE;
@@ -371,6 +399,7 @@ static void FillAdOfTypeContLookup(t_Handle h_Ad,
 
         MemCpy8((void*)&p_AdContLookup->gmask, p_Node->p_GlblMask,
                     CC_GLBL_MASK_SIZE);
+        }
     }
 }
 
@@ -1071,6 +1100,7 @@ static bool IsCapwapApplSpecific(t_Handle h_Node)
 }
 #endif /* FM_CAPWAP_SUPPORT */
 
+#ifndef USE_ENHANCED_EHASH
 static t_Error CcUpdateParam(
         t_Handle h_FmPcd, t_Handle h_PcdParams, t_Handle h_FmPort,
         t_FmPcdCcKeyAndNextEngineParams *p_CcKeyAndNextEngineParams,
@@ -1165,6 +1195,34 @@ static t_Error CcUpdateParam(
 
     return E_OK;
 }
+#else /* USE_ENHANCED_EHASH */
+/*
+ * With enhanced ehash, CC tree entries contain CDX enhanced AD content
+ * written by copy_td_to_ccbase(). No NCSW internal parameter update
+ * or recursive tree walking needed — h_CcNode handles are en_exthash_info*
+ * not t_FmPcdCcNode*, so the internal code would crash.
+ * Matching Linux SDK fm_cc.c:1209-1221.
+ */
+static t_Error CcUpdateParam(
+        t_Handle h_FmPcd, t_Handle h_PcdParams, t_Handle h_FmPort,
+        t_FmPcdCcKeyAndNextEngineParams *p_CcKeyAndNextEngineParams,
+        uint16_t numOfEntries, t_Handle h_Ad, bool validate, uint16_t level,
+        t_Handle h_FmTree, bool modify)
+{
+    UNUSED(h_FmPcd);
+    UNUSED(h_PcdParams);
+    UNUSED(h_FmPort);
+    UNUSED(p_CcKeyAndNextEngineParams);
+    UNUSED(numOfEntries);
+    UNUSED(h_Ad);
+    UNUSED(validate);
+    UNUSED(level);
+    UNUSED(h_FmTree);
+    UNUSED(modify);
+
+    return E_OK;
+}
+#endif /* USE_ENHANCED_EHASH */
 
 static ccPrivateInfo_t IcDefineCode(t_FmPcdCcNodeParams *p_CcNodeParam)
 {
@@ -6005,8 +6063,10 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
     t_NetEnvParams netEnvParams;
     uint8_t lastOne = 0;
     uint32_t requiredAction = 0;
+#ifndef USE_ENHANCED_EHASH
     t_FmPcdCcNode *p_FmPcdCcNextNode;
     t_CcNodeInformation ccNodeInfo, *p_CcInformation;
+#endif
 
     SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
     SANITY_CHECK_RETURN_VALUE(p_PcdGroupsParam, E_INVALID_HANDLE, NULL);
@@ -6190,6 +6250,7 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
 
     p_CcTreeTmp = UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
 
+#ifndef USE_ENHANCED_EHASH
     for (i = 0; i < numOfEntries; i++)
     {
         p_KeyAndNextEngineParams = p_Params + i;
@@ -6225,10 +6286,59 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
                 p_CcInformation->index++;
         }
     }
+#else /* USE_ENHANCED_EHASH */
+    for (i = 0; i < numOfEntries; i++)
+    {
+        t_FmPcdCcNextEngineParams *nexteng;
+
+        p_KeyAndNextEngineParams = p_Params + i;
+        nexteng = &p_KeyAndNextEngineParams->nextEngineParams;
+
+        if (nexteng->nextEngine == e_FM_PCD_CC &&
+            nexteng->params.ccParams.h_CcNode)
+        {
+            /* Enhanced external hash table: copy AD into CC tree MURAM slot */
+            copy_td_to_ccbase(nexteng->params.ccParams.h_CcNode, p_CcTreeTmp);
+        }
+        else
+        {
+            /* Non-CC entry (KG/PLCR/DONE): use standard result AD */
+            NextStepAd(p_CcTreeTmp, NULL, nexteng, p_FmPcd);
+        }
+
+        p_CcTreeTmp = PTR_MOVE(p_CcTreeTmp, FM_PCD_CC_AD_ENTRY_SIZE);
+
+        memcpy(&p_FmPcdCcTree->keyAndNextEngineParams[i],
+               p_KeyAndNextEngineParams,
+               sizeof(t_FmPcdCcKeyAndNextEngineParams));
+    }
+
+    /*
+     * Fill unused CC tree entries (numOfEntries..15) with a copy of
+     * entry 0.  A zeroed EHASH AD has table_base=0x0 — FMan DMA to
+     * physical address 0 (not DDR) hangs the task permanently.
+     * Copying entry 0 gives a valid table_base, int_buf_pool, and
+     * global_mem_offset.  The miss_action starts as DONE (0);
+     * ExternalHashTableModifyMissNextEngine propagates the correct
+     * miss action to all copies by scanning for matching table_base_lo.
+     */
+    if (numOfEntries > 0 && numOfEntries < FM_PCD_MAX_NUM_OF_CC_GROUPS)
+    {
+        uint8_t *base = (uint8_t *)
+            UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
+        for (i = numOfEntries; i < FM_PCD_MAX_NUM_OF_CC_GROUPS; i++)
+        {
+            memcpy(base + i * FM_PCD_CC_AD_ENTRY_SIZE,
+                   base,
+                   FM_PCD_CC_AD_ENTRY_SIZE);
+        }
+        }
+#endif /* USE_ENHANCED_EHASH */
 
     FmPcdIncNetEnvOwners(h_FmPcd, p_FmPcdCcTree->netEnvId);
     p_CcTreeTmp = UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
 
+#ifndef USE_ENHANCED_EHASH
     if (!FmPcdLockTryLockAll(p_FmPcd))
     {
         FM_PCD_CcRootDelete(p_FmPcdCcTree);
@@ -6259,6 +6369,7 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
     }
 
     FmPcdLockUnlockAll(p_FmPcd);
+#endif /* USE_ENHANCED_EHASH */
     p_FmPcdCcTree->p_Lock = FmPcdAcquireLock(p_FmPcd);
     if (!p_FmPcdCcTree->p_Lock)
     {
@@ -7112,6 +7223,9 @@ t_Error FM_PCD_MatchTableGetIndexedHashBucket(t_Handle h_CcNode,
 
 t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
 {
+#ifdef USE_ENHANCED_EHASH
+    return ExternalHashTableSet(h_FmPcd, p_Param);
+#else /* !USE_ENHANCED_EHASH */
     t_FmPcdCcNode *p_CcNodeHashTbl;
     t_FmPcdCcNodeParams *p_IndxHashCcNodeParam, *p_ExactMatchCcNodeParam;
     t_FmPcdCcNode *p_CcNode;
@@ -7150,6 +7264,57 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
         REPORT_ERROR(MAJOR, E_INVALID_VALUE,
                 ("RMON statistics mode is not supported for hash table"));
         return NULL;
+    }
+
+    if (p_Param->externalHash)
+    {
+        /*
+         * External hash table: CDX manages the hash buckets in DDR.
+         * NCSW only allocates a minimal t_FmPcdCcNode with a MURAM AD
+         * placeholder.  CDX will take over the AD and rewrite it with
+         * CDX opcode entries.
+         *
+         * The AD is initially zeroed (safe: result type, enqueue to
+         * default FQ).  Packets reaching this node before CDX takes
+         * over will be enqueued to the default queue harmlessly.
+         */
+        t_FmPcdCcNode *p_ExtNode;
+        t_FmPcd *p_FmPcd = (t_FmPcd *)h_FmPcd;
+
+        p_ExtNode = (t_FmPcdCcNode *)XX_Malloc(sizeof(t_FmPcdCcNode));
+        if (!p_ExtNode)
+        {
+            REPORT_ERROR(MAJOR, E_NO_MEMORY, ("external hash CC node"));
+            return NULL;
+        }
+        memset(p_ExtNode, 0, sizeof(t_FmPcdCcNode));
+
+        p_ExtNode->externalHash = TRUE;
+        p_ExtNode->h_FmPcd = h_FmPcd;
+        p_ExtNode->kgHashShift = p_Param->kgHashShift;
+        p_ExtNode->statisticsMode = p_Param->statisticsMode;
+
+        /* Allocate MURAM AD for this node */
+        p_ExtNode->h_Ad = (t_Handle)FM_MURAM_AllocMem(
+                p_FmPcd->h_FmMuram,
+                FM_PCD_CC_AD_ENTRY_SIZE, FM_PCD_CC_AD_TABLE_ALIGN);
+        if (!p_ExtNode->h_Ad)
+        {
+            XX_Free(p_ExtNode);
+            REPORT_ERROR(MAJOR, E_NO_MEMORY,
+                    ("MURAM allocation for external hash AD"));
+            return NULL;
+        }
+        MemSet8(p_ExtNode->h_Ad, 0, FM_PCD_CC_AD_ENTRY_SIZE);
+
+        p_ExtNode->h_Spinlock = XX_InitSpinlock();
+
+        INIT_LIST(&p_ExtNode->ccPrevNodesLst);
+        INIT_LIST(&p_ExtNode->ccTreeIdLst);
+        INIT_LIST(&p_ExtNode->ccTreesLst);
+        INIT_LIST(&p_ExtNode->availableStatsLst);
+
+        return (t_Handle)p_ExtNode;
     }
 #endif /* (DPAA_VERSION >= 11) */
 
@@ -7305,10 +7470,14 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
     XX_Free(p_ExactMatchCcNodeParam);
 
     return p_CcNodeHashTbl;
+#endif /* !USE_ENHANCED_EHASH */
 }
 
 t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl)
 {
+#ifdef USE_ENHANCED_EHASH
+    return (t_Error)-1; /* delete not implemented for enhanced ehash */
+#else
     t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
     t_Handle h_FmPcd;
     t_Handle *p_HashBuckets, h_MissStatsCounters;
@@ -7316,6 +7485,19 @@ t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl)
     t_Error err;
 
     SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
+
+#if (DPAA_VERSION >= 11)
+    if (p_HashTbl->externalHash)
+    {
+        if (p_HashTbl->h_Ad)
+            FM_MURAM_FreeMem(FmPcdGetMuramHandle(p_HashTbl->h_FmPcd),
+                    p_HashTbl->h_Ad);
+        if (p_HashTbl->h_Spinlock)
+            XX_FreeSpinlock(p_HashTbl->h_Spinlock);
+        XX_Free(p_HashTbl);
+        return E_OK;
+    }
+#endif /* (DPAA_VERSION >= 11) */
 
     /* Store all hash buckets before the hash is freed */
     numOfBuckets = p_HashTbl->numOfKeys;
@@ -7348,11 +7530,20 @@ t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl)
         RETURN_ERROR(MAJOR, err, NO_MSG);
 
     return E_OK;
+#endif /* !USE_ENHANCED_EHASH */
 }
 
 t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
                                t_FmPcdCcKeyParams *p_KeyParams)
 {
+#ifdef USE_ENHANCED_EHASH
+    /* CDX adds keys directly via ExternalHashTableAddKey (different
+     * signature).  This NCSW dispatch path is not used. */
+    UNUSED(h_HashTbl);
+    UNUSED(keySize);
+    UNUSED(p_KeyParams);
+    return E_NOT_SUPPORTED;
+#else
     t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
     t_Handle h_HashBucket;
     uint8_t bucketIndex;
@@ -7377,8 +7568,10 @@ t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
 
     return FM_PCD_MatchTableAddKey(h_HashBucket, FM_PCD_LAST_KEY_INDEX, keySize,
                                    p_KeyParams);
+#endif /* !USE_ENHANCED_EHASH */
 }
 
+#ifndef USE_ENHANCED_EHASH
 t_Error FM_PCD_HashTableRemoveKey(t_Handle h_HashTbl, uint8_t keySize,
                                   uint8_t *p_Key)
 {
@@ -7426,11 +7619,16 @@ t_Error FM_PCD_HashTableModifyNextEngine(
                                                   NULL,
                                                   p_FmPcdCcNextEngineParams);
 }
+#endif /* !USE_ENHANCED_EHASH */
 
 t_Error FM_PCD_HashTableModifyMissNextEngine(
         t_Handle h_HashTbl,
         t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
 {
+#ifdef USE_ENHANCED_EHASH
+    return ExternalHashTableModifyMissNextEngine(h_HashTbl,
+                                                 p_FmPcdCcNextEngineParams);
+#else
     t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
     t_Handle h_HashBucket;
     uint8_t i;
@@ -7483,9 +7681,11 @@ t_Error FM_PCD_HashTableModifyMissNextEngine(
     }
 
     return E_OK;
+#endif /* !USE_ENHANCED_EHASH */
 }
 
 
+#ifndef USE_ENHANCED_EHASH
 t_Error FM_PCD_HashTableGetMissNextEngine(
         t_Handle h_HashTbl,
         t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
@@ -7549,3 +7749,4 @@ t_Error FM_PCD_HashTableGetMissStatistics(
 
     return FM_PCD_MatchTableGetMissStatistics(h_HashBucket, p_MissStatistics);
 }
+#endif /* !USE_ENHANCED_EHASH */

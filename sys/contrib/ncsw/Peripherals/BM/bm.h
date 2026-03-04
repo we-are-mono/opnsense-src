@@ -290,6 +290,8 @@ typedef struct {
     uint32_t                    fbprMemPartitionId;
     uint32_t                    fbprThreshold;
     uint16_t                    liodn;
+    void                        *p_FbprBaseExt;      /* Pre-allocated FBPR, or NULL */
+    uint32_t                    fbprSizeExt;
 } t_BmDriverParams;
 
 typedef struct {
@@ -301,6 +303,7 @@ typedef struct {
     char                        moduleName[MODULE_NAME_SIZE];
     t_BmRegs                    *p_BmRegs;
     void                        *p_FbprBase;
+    bool                        fbprExternal;        /* FBPR memory externally allocated */
     uint32_t                    exceptions;
     t_BmExceptionsCallback      *f_Exception;
     t_Handle                    h_App;

@@ -40,6 +40,7 @@
 *//***************************************************************************/
 #include <sys/cdefs.h>
 #include <sys/types.h>
+#include <sys/systm.h>
 #include <machine/atomic.h>
 
 #include "std_ext.h"
@@ -55,15 +56,28 @@
 /***************************/
 
 /* Cache-inhibited register offsets */
+#if defined(__aarch64__)
+/*
+ * ARM64 Layerscape (LS1046A etc.): CI space is 16KB per portal.
+ * Register offsets are spread out compared to PowerPC.
+ * See Linux drivers/soc/fsl/qbman/bman.c for reference.
+ */
+#define REG_RCR_PI_CINH     0x3000
+#define REG_RCR_CI_CINH     0x3100
+#define REG_RCR_ITR         0x3200
+#define REG_CFG             0x3300
+#define REG_SCN(n)          (0x3400 + ((n) << 6))
+#define REG_ISR             0x3e00
+#define BM_ISR_SHIFT        6       /* ISR/IER/ISDR/IIR stride: 64 bytes */
+#else /* PowerPC */
 #define REG_RCR_PI_CINH     0x0000
 #define REG_RCR_CI_CINH     0x0004
 #define REG_RCR_ITR         0x0008
 #define REG_CFG             0x0100
 #define REG_SCN(n)          (0x0200 + ((n) << 2))
 #define REG_ISR             0x0e00
-#define REG_IER             0x0e04
-#define REG_ISDR            0x0e08
-#define REG_IIR             0x0e0c
+#define BM_ISR_SHIFT        2       /* ISR/IER/ISDR/IIR stride: 4 bytes */
+#endif
 
 /* Cache-enabled register offsets */
 #define CL_CR               0x0000
@@ -258,9 +272,17 @@ struct bm_rcr_entry *bm_rcr_pend_and_next(struct bm_portal *portal, uint8_t myve
 void bm_rcr_pci_commit(struct bm_portal *portal, uint8_t myverb)
 {
     register struct bm_rcr *rcr = &portal->rcr;
+    struct bm_rcr_entry *rcursor;
     ASSERT_COND(rcr->busy);
     ASSERT_COND(rcr->pmode == e_BmPortalPCI);
-    rcr->cursor->__dont_write_directly__verb = (uint8_t)(myverb | rcr->vbit);
+    rcursor = rcr->cursor;
+    rcursor->__dont_write_directly__verb = (uint8_t)(myverb | rcr->vbit);
+    /*
+     * ARM64: The portal hardware cannot snoop the CPU cache via CCI-400.
+     * Explicitly flush the entry from cache to portal CE memory before
+     * writing PI.  On PowerPC the CCF provides hardware coherency.
+     */
+    dcbf_64(rcursor);
     RCR_INC(rcr);
     rcr->available--;
     mb();
@@ -298,7 +320,7 @@ void bm_rcr_pvb_commit(struct bm_portal *portal, uint8_t myverb)
     struct bm_rcr_entry *rcursor;
     ASSERT_COND(rcr->busy);
     ASSERT_COND(rcr->pmode == e_BmPortalPVB);
-    rmb();
+    wmb();
     rcursor = rcr->cursor;
     rcursor->__dont_write_directly__verb = (uint8_t)(myverb | rcr->vbit);
     dcbf_64(rcursor);
@@ -487,12 +509,12 @@ void bm_isr_bscn_mask(struct bm_portal *portal, uint8_t bpid, int enable)
 
 uint32_t __bm_isr_read(struct bm_portal *portal, enum bm_isr_reg n)
 {
-    return __bm_in(&portal->addr, REG_ISR + (n << 2));
+    return __bm_in(&portal->addr, REG_ISR + (n << BM_ISR_SHIFT));
 }
 
 
 void __bm_isr_write(struct bm_portal *portal, enum bm_isr_reg n, uint32_t val)
 {
-    __bm_out(&portal->addr, REG_ISR + (n << 2), val);
+    __bm_out(&portal->addr, REG_ISR + (n << BM_ISR_SHIFT), val);
 }
 

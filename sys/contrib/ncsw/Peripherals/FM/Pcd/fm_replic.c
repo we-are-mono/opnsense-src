@@ -144,7 +144,7 @@ static t_FmPcdFrmReplicMember *GetAvailableMember(t_FmPcdFrmReplicGroup *p_Repli
 
     if (!LIST_IsEmpty(&p_ReplicGroup->availableMembersList))
     {
-        p_Next = LIST_FIRST(&p_ReplicGroup->availableMembersList);
+        p_Next = NCSW_LIST_FIRST(&p_ReplicGroup->availableMembersList);
         p_ReplicMember = LIST_OBJECT(p_Next, t_FmPcdFrmReplicMember, node);
         ASSERT_COND(p_ReplicMember);
         LIST_DelAndInit(p_Next);
@@ -643,7 +643,7 @@ void  FrmReplicGroupUpdateOwner(t_Handle                   h_ReplicGroup,
     }
 }
 
-t_Error FrmReplicGroupTryLock(t_Handle h_ReplicGroup)
+static t_Error FrmReplicGroupTryLock(t_Handle h_ReplicGroup)
 {
     t_FmPcdFrmReplicGroup *p_ReplicGroup = (t_FmPcdFrmReplicGroup *)h_ReplicGroup;
 
@@ -655,7 +655,7 @@ t_Error FrmReplicGroupTryLock(t_Handle h_ReplicGroup)
     return ERROR_CODE(E_BUSY);
 }
 
-void FrmReplicGroupUnlock(t_Handle h_ReplicGroup)
+static void FrmReplicGroupUnlock(t_Handle h_ReplicGroup)
 {
     t_FmPcdFrmReplicGroup *p_ReplicGroup = (t_FmPcdFrmReplicGroup *)h_ReplicGroup;
 

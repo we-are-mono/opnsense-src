@@ -43,7 +43,11 @@
 #ifndef __CORE_EXT_H
 #define __CORE_EXT_H
 
-#ifdef CONFIG_FMAN_ARM
+#if defined(NCSW_ARM_CORE)
+/* FreeBSD ARM64 path — CORE_CACHELINE_SIZE set in dflags_arm64.h */
+#include "arm_ext.h"
+#elif defined(CONFIG_FMAN_ARM)
+/* Linux ARM path */
 #include "arm_ext.h"
 #include <linux/smp.h>
 #else
@@ -63,7 +67,7 @@
 #error "Must define the core cache-line size!"
 #endif /* !CORE_CACHELINE_SIZE */
 
-#endif /* CONFIG_FMAN_ARM */
+#endif /* NCSW_ARM_CORE / CONFIG_FMAN_ARM */
 
 
 /**************************************************************************//**
