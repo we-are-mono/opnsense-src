@@ -1670,6 +1670,8 @@ pf_state_insert(struct pfi_kkif *kif, struct pfi_kkif *orig_kif,
 	pf_counter_u64_add(&V_pf_status.fcounters[FCNT_STATE_INSERT], 1);
 	if (V_pfsync_insert_state_ptr != NULL)
 		V_pfsync_insert_state_ptr(s);
+	if (V_pfnotify_insert_state_ptr != NULL)
+		V_pfnotify_insert_state_ptr(s);
 
 	/* Returns locked. */
 	return (0);
@@ -2457,6 +2459,8 @@ pf_unlink_state(struct pf_kstate *s)
 
 	if (V_pfsync_delete_state_ptr != NULL)
 		V_pfsync_delete_state_ptr(s);
+	if (V_pfnotify_delete_state_ptr != NULL)
+		V_pfnotify_delete_state_ptr(s);
 
 	STATE_DEC_COUNTERS(s);
 
@@ -8660,6 +8664,8 @@ pf_test(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0,
 			if (s != NULL) {
 				if (V_pfsync_update_state_ptr != NULL)
 					V_pfsync_update_state_ptr(s);
+				if (V_pfnotify_update_state_ptr != NULL)
+					V_pfnotify_update_state_ptr(s);
 				r = s->rule.ptr;
 				a = s->anchor.ptr;
 			}
@@ -8725,6 +8731,8 @@ pf_test(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0,
 			if (s != NULL) {
 				if (V_pfsync_update_state_ptr != NULL)
 					V_pfsync_update_state_ptr(s);
+				if (V_pfnotify_update_state_ptr != NULL)
+					V_pfnotify_update_state_ptr(s);
 				r = s->rule.ptr;
 				a = s->anchor.ptr;
 			}
@@ -8758,6 +8766,8 @@ pf_test(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0,
 		if (action == PF_PASS) {
 			if (V_pfsync_update_state_ptr != NULL)
 				V_pfsync_update_state_ptr(s);
+			if (V_pfnotify_update_state_ptr != NULL)
+				V_pfnotify_update_state_ptr(s);
 			r = s->rule.ptr;
 			a = s->anchor.ptr;
 		} else if (s == NULL) {
@@ -8778,6 +8788,8 @@ pf_test(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0,
 		if (action == PF_PASS) {
 			if (V_pfsync_update_state_ptr != NULL)
 				V_pfsync_update_state_ptr(s);
+			if (V_pfnotify_update_state_ptr != NULL)
+				V_pfnotify_update_state_ptr(s);
 			r = s->rule.ptr;
 			a = s->anchor.ptr;
 		} else if (s == NULL)
@@ -8800,6 +8812,8 @@ pf_test(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0,
 		if (action == PF_PASS) {
 			if (V_pfsync_update_state_ptr != NULL)
 				V_pfsync_update_state_ptr(s);
+			if (V_pfnotify_update_state_ptr != NULL)
+				V_pfnotify_update_state_ptr(s);
 			r = s->rule.ptr;
 			a = s->anchor.ptr;
 		} else if (s == NULL)
@@ -9318,6 +9332,8 @@ pf_test6(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0, struct inpcb 
 		if (action == PF_PASS) {
 			if (V_pfsync_update_state_ptr != NULL)
 				V_pfsync_update_state_ptr(s);
+			if (V_pfnotify_update_state_ptr != NULL)
+				V_pfnotify_update_state_ptr(s);
 			r = s->rule.ptr;
 			a = s->anchor.ptr;
 		} else if (s == NULL) {
@@ -9382,6 +9398,8 @@ pf_test6(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0, struct inpcb 
 		if (action == PF_PASS) {
 			if (V_pfsync_update_state_ptr != NULL)
 				V_pfsync_update_state_ptr(s);
+			if (V_pfnotify_update_state_ptr != NULL)
+				V_pfnotify_update_state_ptr(s);
 			r = s->rule.ptr;
 			a = s->anchor.ptr;
 		} else if (s == NULL)
@@ -9412,6 +9430,8 @@ pf_test6(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0, struct inpcb 
 		if (action == PF_PASS) {
 			if (V_pfsync_update_state_ptr != NULL)
 				V_pfsync_update_state_ptr(s);
+			if (V_pfnotify_update_state_ptr != NULL)
+				V_pfnotify_update_state_ptr(s);
 			r = s->rule.ptr;
 			a = s->anchor.ptr;
 		} else if (s == NULL) {
@@ -9439,6 +9459,8 @@ pf_test6(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0, struct inpcb 
 		if (action == PF_PASS) {
 			if (V_pfsync_update_state_ptr != NULL)
 				V_pfsync_update_state_ptr(s);
+			if (V_pfnotify_update_state_ptr != NULL)
+				V_pfnotify_update_state_ptr(s);
 			r = s->rule.ptr;
 			a = s->anchor.ptr;
 		} else if (s == NULL)
@@ -9452,6 +9474,8 @@ pf_test6(int dir, int pflags, struct ifnet *ifp, struct mbuf **m0, struct inpcb 
 		if (action == PF_PASS) {
 			if (V_pfsync_update_state_ptr != NULL)
 				V_pfsync_update_state_ptr(s);
+			if (V_pfnotify_update_state_ptr != NULL)
+				V_pfnotify_update_state_ptr(s);
 			r = s->rule.ptr;
 			a = s->anchor.ptr;
 		} else if (s == NULL)

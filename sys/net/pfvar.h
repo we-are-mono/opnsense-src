@@ -1198,6 +1198,28 @@ VNET_DECLARE(pfsync_defer_t *, pfsync_defer_ptr);
 #define V_pfsync_defer_ptr		VNET(pfsync_defer_ptr)
 extern pfsync_detach_ifnet_t	*pfsync_detach_ifnet_ptr;
 
+/*
+ * pf_notify — offload state change notification (separate from pfsync).
+ *
+ * Lock context for callbacks:
+ *   INSERT: PF_HASHROW_LOCK held, NET_EPOCH
+ *   UPDATE: PF_RULES_RLOCK + PF_STATE_LOCK(s) held, NET_EPOCH
+ *   DELETE: PF_HASHROW_LOCK held, NET_EPOCH
+ *
+ * Callbacks MUST NOT sleep, acquire PF_RULES_WLOCK, or re-enter the
+ * pf state machine.
+ */
+typedef void		pfnotify_insert_state_t(struct pf_kstate *);
+typedef void		pfnotify_update_state_t(struct pf_kstate *);
+typedef void		pfnotify_delete_state_t(struct pf_kstate *);
+
+VNET_DECLARE(pfnotify_insert_state_t *, pfnotify_insert_state_ptr);
+#define V_pfnotify_insert_state_ptr	VNET(pfnotify_insert_state_ptr)
+VNET_DECLARE(pfnotify_update_state_t *, pfnotify_update_state_ptr);
+#define V_pfnotify_update_state_ptr	VNET(pfnotify_update_state_ptr)
+VNET_DECLARE(pfnotify_delete_state_t *, pfnotify_delete_state_ptr);
+#define V_pfnotify_delete_state_ptr	VNET(pfnotify_delete_state_ptr)
+
 void			pfsync_state_export_1301(struct pfsync_state_1301 *,
 			    struct pf_kstate *);
 void			pfsync_state_export_1400(struct pfsync_state_1400 *,
