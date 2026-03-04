@@ -103,6 +103,45 @@ typedef enum
     e_QM_FQ_CHANNEL_SWPORTAL8,
     e_QM_FQ_CHANNEL_SWPORTAL9,
 
+#ifdef __aarch64__
+    /* QMan v3 (LS1046A): pool channels at 0x401-0x40F, FMan DC at 0x800+,
+     * CAAM at 0x840.  SW portal channels (0-9) are unchanged. */
+    e_QM_FQ_CHANNEL_POOL1 = 0x401,
+    e_QM_FQ_CHANNEL_POOL2,
+    e_QM_FQ_CHANNEL_POOL3,
+    e_QM_FQ_CHANNEL_POOL4,
+    e_QM_FQ_CHANNEL_POOL5,
+    e_QM_FQ_CHANNEL_POOL6,
+    e_QM_FQ_CHANNEL_POOL7,
+    e_QM_FQ_CHANNEL_POOL8,
+    e_QM_FQ_CHANNEL_POOL9,
+    e_QM_FQ_CHANNEL_POOL10,
+    e_QM_FQ_CHANNEL_POOL11,
+    e_QM_FQ_CHANNEL_POOL12,
+    e_QM_FQ_CHANNEL_POOL13,
+    e_QM_FQ_CHANNEL_POOL14,
+    e_QM_FQ_CHANNEL_POOL15,
+
+    e_QM_FQ_CHANNEL_FMAN0_SP0 = 0x800,
+    e_QM_FQ_CHANNEL_FMAN0_SP1,
+    e_QM_FQ_CHANNEL_FMAN0_SP2,
+    e_QM_FQ_CHANNEL_FMAN0_SP3,
+    e_QM_FQ_CHANNEL_FMAN0_SP4,
+    e_QM_FQ_CHANNEL_FMAN0_SP5,
+    e_QM_FQ_CHANNEL_FMAN0_SP6,
+    e_QM_FQ_CHANNEL_FMAN0_SP7,
+    e_QM_FQ_CHANNEL_FMAN0_SP8,
+    e_QM_FQ_CHANNEL_FMAN0_SP9,
+    e_QM_FQ_CHANNEL_FMAN0_SP10,
+    e_QM_FQ_CHANNEL_FMAN0_SP11,
+    e_QM_FQ_CHANNEL_FMAN0_SP12,
+    e_QM_FQ_CHANNEL_FMAN0_SP13,
+    e_QM_FQ_CHANNEL_FMAN0_SP14,
+    e_QM_FQ_CHANNEL_FMAN0_SP15,
+
+    e_QM_FQ_CHANNEL_CAAM = 0x840
+#else
+    /* QMan v1/v2 (P5020): pool channels at 0x21-0x2F, FMan DC at 0x40+ */
     e_QM_FQ_CHANNEL_POOL1 = 0x21,               /**< Pool channels that can be serviced by any of the software portals */
     e_QM_FQ_CHANNEL_POOL2,
     e_QM_FQ_CHANNEL_POOL3,
@@ -144,6 +183,7 @@ typedef enum
                                                      connected to PME */
     e_QM_FQ_CHANNEL_RAID = 0xC0                 /**< Dedicated channel serviced by Direct Connect Portal 4:
                                                      connected to RAID */
+#endif
 } e_QmFQChannel;
 
 /*****************************************************************************
@@ -156,11 +196,31 @@ typedef enum
 ******************************************************************************/
 #define INTG_MAX_NUM_OF_FM          1
 
+/*
+ * ---------- Architecture-dependent integration parameters ----------
+ *
+ * ARM64 (LS1046A / FManv3, DPAA 1.1)
+ *   Values from NXP Linux SDK LS1043 dpaa_integration_ext.h
+ * PowerPC (P5020 / FManv2, DPAA 1.0)
+ *   Original FreeBSD values
+ */
+#ifdef __aarch64__
+#define	DPAA_VERSION	11
+#else
+#define	DPAA_VERSION	10
+#endif
+
 /* Ports defines */
+#ifdef __aarch64__
+#define FM_MAX_NUM_OF_1G_MACS       6
+#define FM_MAX_NUM_OF_10G_MACS      2
+#define FM_MAX_NUM_OF_OH_PORTS      6
+#else
 #define FM_MAX_NUM_OF_1G_MACS       5
 #define FM_MAX_NUM_OF_10G_MACS      1
-#define FM_MAX_NUM_OF_MACS          (FM_MAX_NUM_OF_1G_MACS + FM_MAX_NUM_OF_10G_MACS)
 #define FM_MAX_NUM_OF_OH_PORTS      7
+#endif
+#define FM_MAX_NUM_OF_MACS          (FM_MAX_NUM_OF_1G_MACS + FM_MAX_NUM_OF_10G_MACS)
 
 #define FM_MAX_NUM_OF_1G_RX_PORTS   FM_MAX_NUM_OF_1G_MACS
 #define FM_MAX_NUM_OF_10G_RX_PORTS  FM_MAX_NUM_OF_10G_MACS
@@ -170,46 +230,85 @@ typedef enum
 #define FM_MAX_NUM_OF_10G_TX_PORTS  FM_MAX_NUM_OF_10G_MACS
 #define FM_MAX_NUM_OF_TX_PORTS      (FM_MAX_NUM_OF_10G_TX_PORTS + FM_MAX_NUM_OF_1G_TX_PORTS)
 
+#ifdef __aarch64__
+#define FM_PORT_MAX_NUM_OF_EXT_POOLS            4           /**< Number of external BM pools per Rx port */
+#define FM_MAX_NUM_OF_SUB_PORTALS               16
+#else
 #define FM_PORT_MAX_NUM_OF_EXT_POOLS            8           /**< Number of external BM pools per Rx port */
-#define FM_PORT_NUM_OF_CONGESTION_GRPS          256         /**< Total number of congestion groups in QM */
 #define FM_MAX_NUM_OF_SUB_PORTALS               12
+#endif
+#define FM_PORT_NUM_OF_CONGESTION_GRPS          256         /**< Total number of congestion groups in QM */
 #define FM_PORT_MAX_NUM_OF_OBSERVED_EXT_POOLS   0
 
+#if (DPAA_VERSION >= 11)
+#define FM_VSP_MAX_NUM_OF_ENTRIES               64
+#define FM_MAX_NUM_OF_PFC_PRIORITIES            8
+#endif
+
 /* RAMs defines */
-#define FM_MURAM_SIZE                   (160 * KILOBYTE)
+#ifdef __aarch64__
+#define FM_MURAM_SIZE                   (384 * KILOBYTE)    /**< LS1046A FManv3: 384KB MURAM */
+#else
+#define FM_MURAM_SIZE                   (160 * KILOBYTE)    /**< P5020 FManv2: 160KB MURAM */
+#endif
 #define FM_IRAM_SIZE(a,b)               ( 64 * KILOBYTE)
 
 /* PCD defines */
 #define FM_PCD_PLCR_NUM_ENTRIES         256                 /**< Total number of policer profiles */
 #define FM_PCD_KG_NUM_OF_SCHEMES        32                  /**< Total number of KG schemes */
 #define FM_PCD_MAX_NUM_OF_CLS_PLANS     256                 /**< Number of classification plan entries. */
+#define	FM_PCD_SW_PRS_SIZE              0x00000800
+#ifdef __aarch64__
+#define	FM_PCD_PRS_SW_PATCHES_SIZE      0x00000600
+#else
+#define	FM_PCD_PRS_SW_PATCHES_SIZE      0x00000200
+#endif
 
 /* RTC defines */
 #define FM_RTC_NUM_OF_ALARMS            2                   /**< RTC number of alarms */
+#ifdef __aarch64__
+#define FM_RTC_NUM_OF_PERIODIC_PULSES   3                   /**< RTC number of periodic pulses */
+#else
 #define FM_RTC_NUM_OF_PERIODIC_PULSES   2                   /**< RTC number of periodic pulses */
+#endif
 #define FM_RTC_NUM_OF_EXT_TRIGGERS      2                   /**< RTC number of external triggers */
 
 /* QMI defines */
 #define QMI_MAX_NUM_OF_TNUMS            64
+#ifdef __aarch64__
+#define QMI_DEF_TNUMS_THRESH            32
+#else
 #define MAX_QMI_DEQ_SUBPORTAL           12
 #define QMI_DEF_TNUMS_THRESH            48
+#endif
 
 /* FPM defines */
 #define FM_NUM_OF_FMAN_CTRL_EVENT_REGS  4
 
 /* DMA defines */
+#ifdef __aarch64__
+#define DMA_THRESH_MAX_COMMQ            83
+#else
 #define DMA_THRESH_MAX_COMMQ            31
+#endif
 #define DMA_THRESH_MAX_BUF              127
 
 /* BMI defines */
 #define BMI_MAX_NUM_OF_TASKS            128
+#ifdef __aarch64__
+#define BMI_MAX_NUM_OF_DMAS             84
+#define	FM_NUM_OF_CTRL                  4
+#else
 #define BMI_MAX_NUM_OF_DMAS             32
+#define	FM_NUM_OF_CTRL                  2
+#endif
 #define BMI_MAX_FIFO_SIZE               (FM_MURAM_SIZE)
 #define PORT_MAX_WEIGHT                 16
 
 
 #define FM_CHECK_PORT_RESTRICTIONS(__validPorts, __newPortIndx)   TRUE
 
+#ifndef __aarch64__
 /* P5020 unique features */
 #define FM_QMI_DEQ_OPTIONS_SUPPORT
 #define FM_NO_DISPATCH_RAM_ECC
@@ -250,8 +349,6 @@ typedef enum
 #define FM_IM_LARGE_MRBLR_ERRATA_FMAN15                         /* Implemented by ucode */
 #define FM_BMI_TO_RISC_ENQ_ERRATA_FMANc                         /* No implementation, Out of LLD scope */
 #define FM_INVALID_SWPRS_DATA_ERRATA_FMANd
-//#define FM_PRS_MPLS_SSA_ERRATA_FMANj                            /* No implementation, No patch yet */
-//#define FM_PRS_INITIAL_PLANID_ERRATA_FMANk                      /* No implementation, No patch yet */
 
 #define FM_NO_COPY_CTXA_CTXB_ERRATA_FMAN_SW001
 
@@ -260,16 +357,35 @@ typedef enum
 /* P2041 */
 #define FM_BAD_VLAN_DETECT_ERRATA_10GMAC_A010
 
-/* Common to all */
+/* Common to P5020 */
 #define FM_RX_PREAM_4_ERRATA_DTSEC_A001                 FM_NO_RX_PREAM_ERRATA_DTSECx1
 #define FM_UCODE_NOT_RESET_ERRATA_BUGZILLA6173
 #define FM_MAGIC_PACKET_UNRECOGNIZED_ERRATA_DTSEC2              /* No implementation, Out of LLD scope */
 #define FM_PRS_MEM_ERRATA_FMAN_SW003
-#define FM_LEN_CHECK_ERRATA_FMAN_SW002
 
-#define	DPAA_VERSION	10
-#define	FM_PCD_SW_PRS_SIZE	0x00000800
-#define	FM_PCD_PRS_SW_PATCHES_SIZE	0x00000200
-#define	FM_NUM_OF_CTRL	2
+#else /* __aarch64__ — LS1046A / FManv3 errata and features */
+
+#define FM_OP_OPEN_DMA_MIN_LIMIT
+#define FM_NO_RESTRICT_ON_ACCESS_RSRC
+#define FM_NO_OP_OBSERVED_POOLS
+#define FM_FRAME_END_PARAMS_FOR_OP
+#define FM_DEQ_PIPELINE_PARAMS_FOR_OP
+#define FM_QMI_NO_SINGLE_ECC_EXCEPTION
+#define FM_NO_GUARANTEED_RESET_VALUES
+
+/* LS1046A / FManv3 errata */
+#define FM_HEAVY_TRAFFIC_HANG_ERRATA_FMAN_A005669
+#define FM_WRONG_RESET_VALUES_ERRATA_FMAN_A005127
+#define FM_RX_FIFO_CORRUPT_ERRATA_10GMAC_A006320
+#define FM_OP_NO_VSP_NO_RELEASE_ERRATA_FMAN_A006675
+#define FM_HEAVY_TRAFFIC_SEQUENCER_HANG_ERRATA_FMAN_A006981
+#define FM_BCB_ERRATA_BMI_SW001
+#define FM_AID_MODE_NO_TNUM_SW005
+#define FM_ERROR_VSP_NO_MATCH_SW006
+
+#endif /* __aarch64__ */
+
+/* Common to all platforms */
+#define FM_LEN_CHECK_ERRATA_FMAN_SW002
 
 #endif /* __DPAA_INTEGRATION_EXT_H */

@@ -228,7 +228,12 @@ static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqN
         XX_UDelay(100);
 
     if (!timeout)
+    {
+        intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+        p_FmHc->enqueued[seqNum] = FALSE;
+        FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
         RETURN_ERROR(MINOR, E_TIMEOUT, ("HC Callback, timeout exceeded"));
+    }
 
     return err;
 }

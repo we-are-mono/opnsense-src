@@ -1,6 +1,6 @@
 /******************************************************************************
 
- � 1995-2003, 2004, 2005-2011 Freescale Semiconductor, Inc.
+ � 1995-2003, 2004, 2005-2011 Freescale Semiconductor, Inc.
  All rights reserved.
 
  This is proprietary source code of Freescale Semiconductor Inc.,
@@ -64,22 +64,69 @@
  * call.  Take advantage of this fact to shove a 64-bit kernel pointer into a
  * 32-bit context integer, and back.
  *
- * XXX: This depends on the fact that VM_MAX_KERNEL_ADDRESS is less than 38-bit
- * count from VM_MIN_KERNEL_ADDRESS.  If this ever changes, this needs to be
- * updated.
+ * On ARM64, encode the physical address shifted by 6 (64-byte alignment).
+ * XX_MallocSmart uses malloc() which returns DMAP addresses — virtual
+ * address encoding is not feasible because the DMAP-to-KVA offset exceeds
+ * 32 bits.  Physical addresses on LS1046A are ≤10GB, so shifted by 6 they
+ * fit trivially in 32 bits (max ~160M).  Reconstruction uses XX_PhysToVirt
+ * which returns the DMAP virtual address.
+ *
+ * On PowerPC, shift by 3 (8-byte alignment) relative to VM_MIN_KERNEL_ADDRESS.
  */
+#if defined(__aarch64__)
+#define	QMAN_CTX_SHIFT	6
+static inline uint32_t
+aligned_int_from_ptr(const void *p)
+{
+	physAddress_t pa;
+	uint32_t result;
+
+	pa = XX_VirtToPhys((void *)(uintptr_t)p);
+	KASSERT((pa & ((1 << QMAN_CTX_SHIFT) - 1)) == 0,
+	    ("Pointer %p (pa %#lx) is not %d-byte aligned!\n",
+	    p, (unsigned long)pa, 1 << QMAN_CTX_SHIFT));
+
+	result = (uint32_t)(pa >> QMAN_CTX_SHIFT);
+	KASSERT((physAddress_t)result == (pa >> QMAN_CTX_SHIFT),
+	    ("%s: %p (pa %#lx) overflows 32-bit context\n",
+	    __func__, p, (unsigned long)pa));
+
+	return (result);
+}
+
+static inline void *
+ptr_from_aligned_int(uint32_t ctx)
+{
+	physAddress_t pa;
+
+	pa = (physAddress_t)ctx << QMAN_CTX_SHIFT;
+
+	return (XX_PhysToVirt(pa));
+}
+#else
 CTASSERT((VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS) < (1ULL << 35));
+#define	QMAN_CTX_SHIFT	3
+#define	QMAN_CTX_BASE	VM_MIN_KERNEL_ADDRESS
 static inline uint32_t
 aligned_int_from_ptr(const void *p)
 {
 	uintptr_t ctx;
+	uint32_t result;
 
 	ctx = (uintptr_t)p;
-	KASSERT(ctx >= VM_MIN_KERNEL_ADDRESS, ("%p is too low!\n", p));
-	ctx -= VM_MIN_KERNEL_ADDRESS;
-	KASSERT((ctx & 0x07) == 0, ("Pointer %p is not 8-byte aligned!\n", p));
+	KASSERT(ctx >= QMAN_CTX_BASE,
+	    ("%s: %p is below base %#lx\n", __func__, p,
+	    (unsigned long)QMAN_CTX_BASE));
+	ctx -= QMAN_CTX_BASE;
+	KASSERT((ctx & ((1 << QMAN_CTX_SHIFT) - 1)) == 0,
+	    ("Pointer %p is not %d-byte aligned!\n", p, 1 << QMAN_CTX_SHIFT));
 
-	return (ctx >> 3);
+	result = (ctx >> QMAN_CTX_SHIFT);
+	KASSERT((uintptr_t)result == (ctx >> QMAN_CTX_SHIFT),
+	    ("%s: %p overflows 32-bit context (shifted %#lx)\n",
+	    __func__, p, (unsigned long)(ctx >> QMAN_CTX_SHIFT)));
+
+	return (result);
 }
 
 static inline void *
@@ -88,9 +135,58 @@ ptr_from_aligned_int(uint32_t ctx)
 	uintptr_t p;
 
 	p = ctx;
-	p = VM_MIN_KERNEL_ADDRESS + (p << 3);
+	p = QMAN_CTX_BASE + (p << QMAN_CTX_SHIFT);
 
 	return ((void *)p);
+}
+#endif
+
+/*
+ * Copy a frame descriptor from CE portal memory (big-endian) to a native
+ * t_DpaaFD struct with proper byte-swapping.  On big-endian (PowerPC),
+ * GET_UINT32 is a plain load so this is equivalent to a raw copy.
+ *
+ * On LE (ARM64), t_DpaaFD swaps the word order of the first 8 bytes:
+ *   HW (BE):     [liodn,bpid,elion,addrh][addrl_BE]
+ *   t_DpaaFD LE: [addrl_LE][addrh,elion,bpid,liodn]
+ * So we swap word positions AND byte-swap each word (equivalent to bswap64).
+ */
+static inline void
+qm_fd_read(t_DpaaFD *dst, const volatile struct qm_fd *src)
+{
+	const volatile uint32_t *s = (const volatile uint32_t *)src;
+	uint32_t *d = (uint32_t *)dst;
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	d[0] = s[0];
+	d[1] = s[1];
+#else
+	d[0] = GET_UINT32(s[1]);
+	d[1] = GET_UINT32(s[0]);
+#endif
+	d[2] = GET_UINT32(s[2]);
+	d[3] = GET_UINT32(s[3]);
+}
+
+/*
+ * Copy a native t_DpaaFD to CE portal memory (big-endian) with proper
+ * byte-swapping.  Reverse of qm_fd_read().
+ */
+static inline void
+qm_fd_write(volatile struct qm_fd *dst, const t_DpaaFD *src)
+{
+	volatile uint32_t *d = (volatile uint32_t *)dst;
+	const uint32_t *s = (const uint32_t *)src;
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	d[0] = s[0];
+	d[1] = s[1];
+#else
+	WRITE_UINT32(d[0], s[1]);
+	WRITE_UINT32(d[1], s[0]);
+#endif
+	WRITE_UINT32(d[2], s[2]);
+	WRITE_UINT32(d[3], s[3]);
 }
 
 static t_Error qman_volatile_dequeue(t_QmPortal     *p_QmPortal,
@@ -152,7 +248,7 @@ static t_Error qman_create_fq(t_QmPortal        *p_QmPortal,
     /* Everything else is RECOVER support */
     NCSW_PLOCK(p_QmPortal);
     p_Mcc = qm_mc_start(p_QmPortal->p_LowQmPortal);
-    p_Mcc->queryfq.fqid = fqid;
+    WRITE_UINT32(p_Mcc->queryfq.fqid, fqid);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_QUERYFQ);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCC_VERB_QUERYFQ);
@@ -162,7 +258,7 @@ static t_Error qman_create_fq(t_QmPortal        *p_QmPortal,
     }
     fqd = p_Mcr->queryfq.fqd;
     p_Mcc = qm_mc_start(p_QmPortal->p_LowQmPortal);
-    p_Mcc->queryfq_np.fqid = fqid;
+    WRITE_UINT32(p_Mcc->queryfq_np.fqid, fqid);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_QUERYFQ_NP);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCC_VERB_QUERYFQ_NP);
@@ -245,7 +341,56 @@ static t_Error qman_init_fq(t_QmPortal          *p_QmPortal,
         return ERROR_CODE(E_BUSY);
     }
     p_Mcc = qm_mc_start(p_QmPortal->p_LowQmPortal);
+#ifdef __aarch64__
+    /*
+     * Portal CE memory is big-endian on QorIQ ARM64 (LS1046A).
+     * Mem2IOCpy32 doesn't handle LE→BE conversion correctly for packed
+     * structs whose fields span 32-bit word boundaries — the byte-by-byte
+     * prefix and the unaligned shift-merge were designed for big-endian
+     * PowerPC only.  Write each field individually using WRITE_UINTxx
+     * (out{8,16,32}rb) which byte-swap LE values to BE portal bytes.
+     *
+     * Bitfield-containing sub-fields (dest_wq, td_thresh) must be manually
+     * reconstructed in BE bit layout because GCC allocates bitfields from
+     * LSB on LE vs MSB on BE.
+     */
+    WRITE_UINT8(p_Mcc->initfq.reserved1, 0);
+    WRITE_UINT16(p_Mcc->initfq.we_mask, p_Opts->we_mask);
+    WRITE_UINT32(p_Mcc->initfq.fqid, p_Opts->fqid);
+    WRITE_UINT16(p_Mcc->initfq.count, p_Opts->count);
+    /* FQD sub-struct */
+    WRITE_UINT8(p_Mcc->initfq.fqd.orpc, p_Opts->fqd.orpc);
+    WRITE_UINT8(p_Mcc->initfq.fqd.cgid, p_Opts->fqd.cgid);
+    WRITE_UINT16(p_Mcc->initfq.fqd.fq_ctrl, p_Opts->fqd.fq_ctrl);
+    {
+        /* dest_wq has bitfields channel:13 wq:3.
+         * BE bit layout: channel(bits15-3) wq(bits2-0). */
+        uint16_t dest_wq_be = ((uint16_t)(p_Opts->fqd.dest.channel & 0x1FFF) << 3) |
+                              (p_Opts->fqd.dest.wq & 0x7);
+        WRITE_UINT16(p_Mcc->initfq.fqd.dest_wq, dest_wq_be);
+    }
+    {
+        /* reserved2:1 + ics_cred:15 are bare bitfields with no union accessor.
+         * Address the 16-bit word via the preceding dest_wq union. */
+        volatile uint16_t *p_ics = (volatile uint16_t *)&p_Mcc->initfq.fqd.dest_wq + 1;
+        /* BE bit layout: reserved2(bit15) ics_cred(bits14-0). reserved2=0. */
+        uint16_t ics_be = (uint16_t)(p_Opts->fqd.ics_cred & 0x7FFF);
+        WRITE_UINT16(*p_ics, ics_be);
+    }
+    {
+        /* td_thresh has bitfields reserved1:3 mant:8 exp:5.
+         * BE bit layout: reserved(bits15-13) mant(bits12-5) exp(bits4-0). */
+        uint16_t td_be = ((uint16_t)(p_Opts->fqd.td.mant & 0xFF) << 5) |
+                         (p_Opts->fqd.td.exp & 0x1F);
+        WRITE_UINT16(p_Mcc->initfq.fqd.td_thresh, td_be);
+    }
+    WRITE_UINT32(p_Mcc->initfq.fqd.context_b, p_Opts->fqd.context_b);
+    WRITE_UINT32(p_Mcc->initfq.fqd.context_a.hi, p_Opts->fqd.context_a.hi);
+    WRITE_UINT32(p_Mcc->initfq.fqd.context_a.lo, p_Opts->fqd.context_a.lo);
+    /* reserved3[32] already zeroed by dcbz_64 in qm_mc_start */
+#else
     Mem2IOCpy32((void*)&p_Mcc->initfq, p_Opts, sizeof(struct qm_mcc_initfq));
+#endif
     qm_mc_commit(p_QmPortal->p_LowQmPortal, myverb);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == myverb);
@@ -253,17 +398,19 @@ static t_Error qman_init_fq(t_QmPortal          *p_QmPortal,
     if (res != QM_MCR_RESULT_OK) {
         FQUNLOCK(p_Fq);
         PUNLOCK(p_QmPortal);
-        RETURN_ERROR(MINOR, E_INVALID_STATE,("INITFQ failed: %s", mcr_result_str(res)));
+        RETURN_ERROR(MINOR, E_INVALID_STATE,("INITFQ failed: fqid=%d %s",
+            p_Fq->fqid, mcr_result_str(res)));
     }
 
-    if (p_Mcc->initfq.we_mask & QM_INITFQ_WE_FQCTRL) {
-        if (p_Mcc->initfq.fqd.fq_ctrl & QM_FQCTRL_CGE)
+    /* Read flags back from the source struct, not portal CE (which is BE) */
+    if (p_Opts->we_mask & QM_INITFQ_WE_FQCTRL) {
+        if (p_Opts->fqd.fq_ctrl & QM_FQCTRL_CGE)
             p_Fq->flags |= QMAN_FQ_STATE_CGR_EN;
         else
             p_Fq->flags &= ~QMAN_FQ_STATE_CGR_EN;
     }
-    if (p_Mcc->initfq.we_mask & QM_INITFQ_WE_CGID)
-        p_Fq->cgr_groupid = p_Mcc->initfq.fqd.cgid;
+    if (p_Opts->we_mask & QM_INITFQ_WE_CGID)
+        p_Fq->cgr_groupid = p_Opts->fqd.cgid;
     p_Fq->state = (flags & QMAN_INITFQ_FLAG_SCHED) ?
             qman_fq_state_sched : qman_fq_state_parked;
     FQUNLOCK(p_Fq);
@@ -296,9 +443,9 @@ static t_Error qman_retire_fq(t_QmPortal        *p_QmPortal,
         goto out;
     }
     p_Mcc = qm_mc_start(p_QmPortal->p_LowQmPortal);
-    p_Mcc->alterfq.fqid = p_Fq->fqid;
+    WRITE_UINT32(p_Mcc->alterfq.fqid, p_Fq->fqid);
     if (drain)
-        p_Mcc->alterfq.context_b = aligned_int_from_ptr(p_Fq);
+        WRITE_UINT32(p_Mcc->alterfq.context_b, aligned_int_from_ptr(p_Fq));
     qm_mc_commit(p_QmPortal->p_LowQmPortal,
                  (uint8_t)((drain)?QM_MCC_VERB_ALTER_RETIRE_CTXB:QM_MCC_VERB_ALTER_RETIRE));
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
@@ -347,7 +494,7 @@ static t_Error qman_oos_fq(t_QmPortal *p_QmPortal, struct qman_fq *p_Fq)
         return ERROR_CODE(E_BUSY);
     }
     p_Mcc = qm_mc_start(p_QmPortal->p_LowQmPortal);
-    p_Mcc->alterfq.fqid = p_Fq->fqid;
+    WRITE_UINT32(p_Mcc->alterfq.fqid, p_Fq->fqid);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_ALTER_OOS);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCR_VERB_ALTER_OOS);
@@ -383,7 +530,7 @@ static t_Error qman_schedule_fq(t_QmPortal *p_QmPortal, struct qman_fq *p_Fq)
         return ERROR_CODE(E_BUSY);
     }
     p_Mcc = qm_mc_start(p_QmPortal->p_LowQmPortal);
-    p_Mcc->alterfq.fqid = p_Fq->fqid;
+    WRITE_UINT32(p_Mcc->alterfq.fqid, p_Fq->fqid);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_ALTER_SCHED);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCR_VERB_ALTER_SCHED);
@@ -607,14 +754,30 @@ mr_loop:
         qmPortalMrPvbUpdate(p_QmPortal->p_LowQmPortal);
         p_Msg = qm_mr_current(p_QmPortal->p_LowQmPortal);
         if (p_Msg) {
-            struct qman_fq  *p_FqFqs  = ptr_from_aligned_int(p_Msg->fq.contextB);
-            struct qman_fq  *p_FqErn  = ptr_from_aligned_int(p_Msg->ern.tag);
+            struct qman_fq  *p_FqFqs  = ptr_from_aligned_int(GET_UINT32(p_Msg->fq.contextB));
+            struct qman_fq  *p_FqErn  = ptr_from_aligned_int(GET_UINT32(p_Msg->ern.tag));
             uint8_t         verb    =(uint8_t)(p_Msg->verb & QM_MR_VERB_TYPE_MASK);
             t_QmRejectedFrameInfo   rejectedFrameInfo;
+            t_DpaaFD        mr_fd;
 
             memset(&rejectedFrameInfo, 0, sizeof(t_QmRejectedFrameInfo));
             if (!(verb & QM_MR_VERB_DC_ERN))
             {
+                qm_fd_read(&mr_fd, &p_Msg->ern.fd);
+                {
+                    static int ern_print_count;
+                    if (ern_print_count++ < 20)
+                        XX_Print("QM ERN: verb=0x%02x rc=0x%02x fqid=%u "
+                            "fd_addr=0x%08x%08x fd_status=0x%x\n",
+                            verb, p_Msg->ern.rc,
+                            p_FqErn ? p_FqErn->fqid : 0,
+                            DPAA_FD_GET_ADDRH(&mr_fd),
+                            DPAA_FD_GET_ADDRL(&mr_fd),
+                            DPAA_FD_GET_STATUS(&mr_fd));
+                }
+                if (DPAA_FD_GET_PHYS_ADDR(&mr_fd) == 0)
+                    XX_Print("LoopMessageRing: ERN FD.addr=0 verb=0x%02x rc=0x%02x\n",
+                        verb, p_Msg->ern.rc);
                 switch(p_Msg->ern.rc)
                 {
                     case(QM_MR_RC_CGR_TAILDROP):
@@ -635,11 +798,17 @@ mr_loop:
                         REPORT_ERROR(MINOR, E_NOT_SUPPORTED, ("Unknown rejection code"));
                 }
                 if (!p_FqErn)
-                    p_QmPortal->p_NullCB->ern(p_QmPortal->h_App, NULL, p_QmPortal, 0, (t_DpaaFD*)&p_Msg->ern.fd, &rejectedFrameInfo);
+                    p_QmPortal->p_NullCB->ern(p_QmPortal->h_App, NULL, p_QmPortal, 0, &mr_fd, &rejectedFrameInfo);
                 else
-                    p_FqErn->cb.ern(p_FqErn->h_App, p_FqErn->h_QmFqr, p_QmPortal, p_FqErn->fqidOffset, (t_DpaaFD*)&p_Msg->ern.fd, &rejectedFrameInfo);
+                    p_FqErn->cb.ern(p_FqErn->h_App, p_FqErn->h_QmFqr, p_QmPortal, p_FqErn->fqidOffset, &mr_fd, &rejectedFrameInfo);
             } else if (verb == QM_MR_VERB_DC_ERN)
             {
+                {
+                    static int dc_ern_count;
+                    if (dc_ern_count++ < 20)
+                        XX_Print("QM DC_ERN: fqid=%u\n",
+                            p_FqErn ? p_FqErn->fqid : 0);
+                }
                 if (!p_FqErn)
                     p_QmPortal->p_NullCB->dc_ern(NULL, p_QmPortal, NULL, p_Msg);
                 else
@@ -676,6 +845,7 @@ static void LoopDequeueRing(t_Handle h_QmPortal)
     e_RxStoreResponse           tmpRes;
     t_QmPortal                  *p_QmPortal = (t_QmPortal *)h_QmPortal;
     int                         prefetch = !(p_QmPortal->options & QMAN_PORTAL_FLAG_RSTASH);
+    t_DpaaFD                    fd;
 
     while (res != qman_cb_dqrr_pause)
     {
@@ -685,12 +855,13 @@ static void LoopDequeueRing(t_Handle h_QmPortal)
         p_Dq = qm_dqrr_current(p_QmPortal->p_LowQmPortal);
         if (!p_Dq)
             break;
-	p_Fq = ptr_from_aligned_int(p_Dq->contextB);
+	p_Fq = ptr_from_aligned_int(GET_UINT32(p_Dq->contextB));
+        qm_fd_read(&fd, &p_Dq->fd);
         if (p_Dq->stat & QM_DQRR_STAT_UNSCHEDULED) {
             /* We only set QMAN_FQ_STATE_NE when retiring, so we only need
              * to check for clearing it when doing volatile dequeues. It's
              * one less thing to check in the critical path (SDQCR). */
-            tmpRes = p_Fq->cb.dqrr(p_Fq->h_App, p_Fq->h_QmFqr, p_QmPortal, p_Fq->fqidOffset, (t_DpaaFD*)&p_Dq->fd);
+            tmpRes = p_Fq->cb.dqrr(p_Fq->h_App, p_Fq->h_QmFqr, p_QmPortal, p_Fq->fqidOffset, &fd);
             if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                 res = qman_cb_dqrr_pause;
             /* Check for VDQCR completion */
@@ -706,14 +877,14 @@ static void LoopDequeueRing(t_Handle h_QmPortal)
         {
             /* Interpret 'dq' from the owner's perspective. */
             /* use portal default handlers */
-            ASSERT_COND(p_Dq->fqid);
+            ASSERT_COND(GET_UINT32(p_Dq->fqid));
             if (p_Fq)
             {
                 tmpRes = p_Fq->cb.dqrr(p_Fq->h_App,
                                        p_Fq->h_QmFqr,
                                        p_QmPortal,
                                        p_Fq->fqidOffset,
-                                       (t_DpaaFD*)&p_Dq->fd);
+                                       &fd);
                 if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                     res = qman_cb_dqrr_pause;
                 else if (p_Fq->state == qman_fq_state_waiting_parked)
@@ -724,8 +895,8 @@ static void LoopDequeueRing(t_Handle h_QmPortal)
                 tmpRes = p_QmPortal->p_NullCB->dqrr(p_QmPortal->h_App,
                                                     NULL,
                                                     p_QmPortal,
-                                                    p_Dq->fqid,
-                                                    (t_DpaaFD*)&p_Dq->fd);
+                                                    GET_UINT32(p_Dq->fqid),
+                                                    &fd);
                 if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                     res = qman_cb_dqrr_pause;
             }
@@ -760,6 +931,7 @@ static void LoopDequeueRingDcaOptimized(t_Handle h_QmPortal)
     enum qman_cb_dqrr_result    res = qman_cb_dqrr_consume;
     e_RxStoreResponse           tmpRes;
     t_QmPortal                  *p_QmPortal = (t_QmPortal *)h_QmPortal;
+    t_DpaaFD                    fd;
 
     while (res != qman_cb_dqrr_pause)
     {
@@ -767,12 +939,13 @@ static void LoopDequeueRingDcaOptimized(t_Handle h_QmPortal)
         p_Dq = qm_dqrr_current(p_QmPortal->p_LowQmPortal);
         if (!p_Dq)
             break;
-	p_Fq = ptr_from_aligned_int(p_Dq->contextB);
+	p_Fq = ptr_from_aligned_int(GET_UINT32(p_Dq->contextB));
+        qm_fd_read(&fd, &p_Dq->fd);
         if (p_Dq->stat & QM_DQRR_STAT_UNSCHEDULED) {
             /* We only set QMAN_FQ_STATE_NE when retiring, so we only need
              * to check for clearing it when doing volatile dequeues. It's
              * one less thing to check in the critical path (SDQCR). */
-            tmpRes = p_Fq->cb.dqrr(p_Fq->h_App, p_Fq->h_QmFqr, p_QmPortal, p_Fq->fqidOffset, (t_DpaaFD*)&p_Dq->fd);
+            tmpRes = p_Fq->cb.dqrr(p_Fq->h_App, p_Fq->h_QmFqr, p_QmPortal, p_Fq->fqidOffset, &fd);
             if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                 res = qman_cb_dqrr_pause;
             /* Check for VDQCR completion */
@@ -788,14 +961,14 @@ static void LoopDequeueRingDcaOptimized(t_Handle h_QmPortal)
         {
             /* Interpret 'dq' from the owner's perspective. */
             /* use portal default handlers */
-            ASSERT_COND(p_Dq->fqid);
+            ASSERT_COND(GET_UINT32(p_Dq->fqid));
             if (p_Fq)
             {
                 tmpRes = p_Fq->cb.dqrr(p_Fq->h_App,
                                        p_Fq->h_QmFqr,
                                        p_QmPortal,
                                        p_Fq->fqidOffset,
-                                       (t_DpaaFD*)&p_Dq->fd);
+                                       &fd);
                 if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                     res = qman_cb_dqrr_pause;
                 else if (p_Fq->state == qman_fq_state_waiting_parked)
@@ -806,8 +979,8 @@ static void LoopDequeueRingDcaOptimized(t_Handle h_QmPortal)
                 tmpRes = p_QmPortal->p_NullCB->dqrr(p_QmPortal->h_App,
                                                     NULL,
                                                     p_QmPortal,
-                                                    p_Dq->fqid,
-                                                    (t_DpaaFD*)&p_Dq->fd);
+                                                    GET_UINT32(p_Dq->fqid),
+                                                    &fd);
                 if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                     res = qman_cb_dqrr_pause;
             }
@@ -834,6 +1007,7 @@ static void LoopDequeueRingOptimized(t_Handle h_QmPortal)
     enum qman_cb_dqrr_result    res = qman_cb_dqrr_consume;
     e_RxStoreResponse           tmpRes;
     t_QmPortal                  *p_QmPortal = (t_QmPortal *)h_QmPortal;
+    t_DpaaFD                    fd;
 
     while (res != qman_cb_dqrr_pause)
     {
@@ -841,12 +1015,13 @@ static void LoopDequeueRingOptimized(t_Handle h_QmPortal)
         p_Dq = qm_dqrr_current(p_QmPortal->p_LowQmPortal);
         if (!p_Dq)
             break;
-	p_Fq = ptr_from_aligned_int(p_Dq->contextB);
+	p_Fq = ptr_from_aligned_int(GET_UINT32(p_Dq->contextB));
+        qm_fd_read(&fd, &p_Dq->fd);
         if (p_Dq->stat & QM_DQRR_STAT_UNSCHEDULED) {
             /* We only set QMAN_FQ_STATE_NE when retiring, so we only need
              * to check for clearing it when doing volatile dequeues. It's
              * one less thing to check in the critical path (SDQCR). */
-            tmpRes = p_Fq->cb.dqrr(p_Fq->h_App, p_Fq->h_QmFqr, p_QmPortal, p_Fq->fqidOffset, (t_DpaaFD*)&p_Dq->fd);
+            tmpRes = p_Fq->cb.dqrr(p_Fq->h_App, p_Fq->h_QmFqr, p_QmPortal, p_Fq->fqidOffset, &fd);
             if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                 res = qman_cb_dqrr_pause;
             /* Check for VDQCR completion */
@@ -862,14 +1037,14 @@ static void LoopDequeueRingOptimized(t_Handle h_QmPortal)
         {
             /* Interpret 'dq' from the owner's perspective. */
             /* use portal default handlers */
-            ASSERT_COND(p_Dq->fqid);
+            ASSERT_COND(GET_UINT32(p_Dq->fqid));
             if (p_Fq)
             {
                 tmpRes = p_Fq->cb.dqrr(p_Fq->h_App,
                                        p_Fq->h_QmFqr,
                                        p_QmPortal,
                                        p_Fq->fqidOffset,
-                                       (t_DpaaFD*)&p_Dq->fd);
+                                       &fd);
                 if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                     res = qman_cb_dqrr_pause;
                 else if (p_Fq->state == qman_fq_state_waiting_parked)
@@ -880,8 +1055,8 @@ static void LoopDequeueRingOptimized(t_Handle h_QmPortal)
                 tmpRes = p_QmPortal->p_NullCB->dqrr(p_QmPortal->h_App,
                                                     NULL,
                                                     p_QmPortal,
-                                                    p_Dq->fqid,
-                                                    (t_DpaaFD*)&p_Dq->fd);
+                                                    GET_UINT32(p_Dq->fqid),
+                                                    &fd);
                 if (tmpRes == e_RX_STORE_RESPONSE_PAUSE)
                     res = qman_cb_dqrr_pause;
             }
@@ -909,6 +1084,26 @@ static void portal_isr(void *ptr)
 
     DBG(TRACE, ("software-portal %d got interrupt", p_QmPortal->p_LowQmPortal->config.cpu));
 
+#ifdef __aarch64__
+    {
+        /* Per-portal ISR invocation counters (max 16 portals) */
+        static volatile uint32_t portal_isr_cnt[16];
+        int cpu = p_QmPortal->p_LowQmPortal->config.cpu;
+        uint32_t cnt;
+        if (cpu >= 0 && cpu < 16)
+            cnt = ++portal_isr_cnt[cpu];
+        else
+            cnt = 0;
+        if (cnt <= 10 || (cnt % 1000 == 0))
+            printf("qman: portal_isr cpu=%d count=%u ISR=0x%x IER=0x%x "
+                "dqrr_fill=%u\n",
+                cpu, cnt,
+                qm_isr_status_read(p_QmPortal->p_LowQmPortal),
+                enableEvents,
+                (unsigned)p_QmPortal->p_LowQmPortal->dqrr.fill);
+    }
+#endif
+
     event |= (qm_isr_status_read(p_QmPortal->p_LowQmPortal) &
             enableEvents);
 
@@ -930,7 +1125,7 @@ static t_Error qman_query_fq_np(t_QmPortal *p_QmPortal, struct qman_fq *p_Fq, st
 
     NCSW_PLOCK(p_QmPortal);
     p_Mcc = qm_mc_start(p_QmPortal->p_LowQmPortal);
-    p_Mcc->queryfq_np.fqid = p_Fq->fqid;
+    WRITE_UINT32(p_Mcc->queryfq_np.fqid, p_Fq->fqid);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_QUERYFQ_NP);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCR_VERB_QUERYFQ_NP);
@@ -1198,6 +1393,105 @@ drain_loop:
     }
 }
 
+/*
+ * Clean up stale frame queues left by a previous boot (e.g. U-Boot).
+ * The QMan hardware's FQD cache may retain FQs in SCHED/ACTIVE state
+ * across a soft reboot.  If not retired, these stale FQs will produce
+ * DQRR entries with invalid contextB pointers, causing a page fault.
+ *
+ * Called during portal creation after DQRR, MR, and MC are initialized
+ * but before ISR setup and SDQCR enable.
+ */
+#define CLEANUP_MAX_FQID    256
+
+static void qman_cleanup_stale_fqs(struct qm_portal *portal)
+{
+    static volatile int cleanup_done = 0;
+    struct qm_mc_command *mcc;
+    struct qm_mc_result *mcr;
+    uint32_t fqid;
+    int cleaned = 0;
+    uint8_t state, res;
+
+    /* All portals see the same global FQ state — only clean up once.
+     * Running on subsequent portals would retire FQs that drivers
+     * legitimately created after the first portal's cleanup. */
+    if (atomic_cmpset_int(&cleanup_done, 0, 1) == 0)
+        return;
+
+    /* Drain any stale DQRR entries from previous boot */
+    while (qmPortalDqrrPvbUpdate(portal),
+           qm_dqrr_current(portal) != NULL) {
+        qm_dqrr_next(portal);
+        qmPortalDqrrCciConsume(portal, 1);
+    }
+    /* Drain any stale MR entries from previous boot */
+    while (qmPortalMrPvbUpdate(portal),
+           qm_mr_current(portal) != NULL) {
+        qm_mr_next(portal);
+        qmPortalMrCciConsume(portal, 1);
+    }
+    /* Retire stale FQs via MC commands */
+    for (fqid = 0; fqid < CLEANUP_MAX_FQID; fqid++) {
+        /* QUERYFQ_NP */
+        mcc = qm_mc_start(portal);
+        WRITE_UINT32(mcc->queryfq_np.fqid, fqid);
+        qm_mc_commit(portal, QM_MCC_VERB_QUERYFQ_NP);
+        while (!(mcr = qm_mc_result(portal)))
+            ;
+        res = mcr->result;
+        if (res != QM_MCR_RESULT_OK)
+            continue;
+        state = mcr->queryfq_np.state & QM_MCR_NP_STATE_MASK;
+        if (state == QM_MCR_NP_STATE_OOS)
+            continue;
+        if (state == QM_MCR_NP_STATE_RETIRED)
+            goto do_oos;
+
+        /* ALTER_RETIRE */
+        mcc = qm_mc_start(portal);
+        WRITE_UINT32(mcc->alterfq.fqid, fqid);
+        qm_mc_commit(portal, QM_MCC_VERB_ALTER_RETIRE);
+        while (!(mcr = qm_mc_result(portal)))
+            ;
+        res = mcr->result;
+        if (res == QM_MCR_RESULT_PENDING) {
+            /* Wait for FQRNI on MR */
+            int timeout = 10000;
+            while (timeout--) {
+                qmPortalMrPvbUpdate(portal);
+                if (qm_mr_current(portal) != NULL) {
+                    qm_mr_next(portal);
+                    qmPortalMrCciConsume(portal, 1);
+                    break;
+                }
+            }
+        } else if (res != QM_MCR_RESULT_OK) {
+            XX_Print("qman_cleanup: fqid %u retire failed 0x%02x\n",
+                fqid, res);
+            continue;
+        }
+
+do_oos:
+        /* ALTER_OOS */
+        mcc = qm_mc_start(portal);
+        WRITE_UINT32(mcc->alterfq.fqid, fqid);
+        qm_mc_commit(portal, QM_MCC_VERB_ALTER_OOS);
+        while (!(mcr = qm_mc_result(portal)))
+            ;
+        res = mcr->result;
+        if (res != QM_MCR_RESULT_OK) {
+            /* OOS may fail if FQ has pending frames.
+             * RETIRED state is safe — FQ won't be scheduled. */
+            XX_Print("qman_cleanup: fqid %u OOS failed 0x%02x "
+                "(left retired)\n", fqid, res);
+        }
+        cleaned++;
+    }
+    if (cleaned)
+        printf("qman: retired %d stale FQs\n", cleaned);
+}
+
 static t_Error qman_create_portal(t_QmPortal *p_QmPortal,
                                    uint32_t flags,
                                    uint32_t sdqcrFlags,
@@ -1230,6 +1524,8 @@ static t_Error qman_create_portal(t_QmPortal *p_QmPortal,
         REPORT_ERROR(MAJOR, E_INVALID_STATE, ("MC initialization failed"));
         goto fail_mc;
     }
+    /* Clean up stale FQs from previous boot before enabling SDQCR */
+    qman_cleanup_stale_fqs(p_QmPortal->p_LowQmPortal);
     if (qm_isr_init(p_QmPortal->p_LowQmPortal)) {
         REPORT_ERROR(MAJOR, E_INVALID_STATE, ("ISR initialization failed"));
         goto fail_isr;
@@ -1272,7 +1568,37 @@ goto fail_dqrr_mr_empty;
 goto fail_dqrr_mr_empty;
     }
     qm_isr_disable_write(p_QmPortal->p_LowQmPortal, 0);
+    /*
+     * Inhibit ISR before enabling SDQCR — stale FQs from a previous boot
+     * (e.g. Linux) may still be in SCHED state.  Enabling SDQCR causes
+     * the hardware to push their DQRR entries immediately.  Drain them
+     * here before the ISR can see them (their contextB pointers are
+     * garbage in this kernel's address space).
+     */
+    qm_isr_inhibit(p_QmPortal->p_LowQmPortal);
     qm_dqrr_sdqcr_set(p_QmPortal->p_LowQmPortal, sdqcrFlags);
+    {
+        int idle = 0;
+        while (idle < 1000) {
+            qmPortalDqrrPvbUpdate(p_QmPortal->p_LowQmPortal);
+            if (qm_dqrr_current(p_QmPortal->p_LowQmPortal) != NULL) {
+                qm_dqrr_next(p_QmPortal->p_LowQmPortal);
+                qmPortalDqrrCciConsume(p_QmPortal->p_LowQmPortal, 1);
+                idle = 0;
+            } else {
+                XX_UDelay(10);
+                idle++;
+            }
+        }
+        /* Also drain any MR entries that appeared */
+        while (qmPortalMrPvbUpdate(p_QmPortal->p_LowQmPortal),
+               qm_mr_current(p_QmPortal->p_LowQmPortal) != NULL) {
+            qm_mr_next(p_QmPortal->p_LowQmPortal);
+            qmPortalMrCciConsume(p_QmPortal->p_LowQmPortal, 1);
+        }
+    }
+    qm_isr_status_clear(p_QmPortal->p_LowQmPortal, 0xffffffff);
+    qm_isr_uninhibit(p_QmPortal->p_LowQmPortal);
     return E_OK;
 fail_dqrr_mr_empty:
 fail_eqcr_empty:
@@ -1341,8 +1667,8 @@ static t_Error qman_orp_update(t_QmPortal   *p_QmPortal,
     else
         /* No need to check 4 QMAN_ENQUEUE_FLAG_HOLE */
         orpSeqnum &= ~QM_EQCR_SEQNUM_NESN;
-    p_Eq->seqnum  = orpSeqnum;
-    p_Eq->orp     = orpId;
+    WRITE_UINT16(p_Eq->seqnum, orpSeqnum);
+    WRITE_UINT32(p_Eq->orp, orpId);
 qmPortalEqcrPvbCommit(p_QmPortal->p_LowQmPortal, (uint8_t)QM_EQCR_VERB_ORP);
 
     PUNLOCK(p_QmPortal);
@@ -1394,7 +1720,7 @@ static t_Error QmPortalUnregisterCg(t_Handle h_QmPortal, uint8_t  cgId)
     if(!(p_QmPortal->cgrs[0].q.__state[cgId/32] & (0x80000000 >> (cgId % 32))))
         RETURN_ERROR(MINOR, E_BUSY, ("CG is not in use"));
 
-    p_QmPortal->cgrs[0].q.__state[cgId/32] &=  ~0x80000000 >> (cgId % 32);
+    p_QmPortal->cgrs[0].q.__state[cgId/32] &=  ~(0x80000000 >> (cgId % 32));
     p_QmPortal->cgsHandles[cgId] = NULL;
 
     return E_OK;
@@ -1494,7 +1820,6 @@ static t_Error QmPortalPullFrame(t_Handle h_QmPortal, uint32_t pdqcr, t_DpaaFD *
     t_QmPortal              *p_QmPortal = (t_QmPortal *)h_QmPortal;
     struct qm_dqrr_entry    *p_Dq;
     int                     prefetch;
-    uint32_t                *p_Dst, *p_Src;
 
     ASSERT_COND(p_QmPortal);
     ASSERT_COND(p_Frame);
@@ -1515,13 +1840,8 @@ static t_Error QmPortalPullFrame(t_Handle h_QmPortal, uint32_t pdqcr, t_DpaaFD *
         p_Dq = qm_dqrr_current(p_QmPortal->p_LowQmPortal);
         if (!p_Dq)
             continue;
-        ASSERT_COND(p_Dq->fqid);
-        p_Dst = (uint32_t *)p_Frame;
-        p_Src = (uint32_t *)&p_Dq->fd;
-        p_Dst[0] = p_Src[0];
-        p_Dst[1] = p_Src[1];
-        p_Dst[2] = p_Src[2];
-        p_Dst[3] = p_Src[3];
+        ASSERT_COND(GET_UINT32(p_Dq->fqid));
+        qm_fd_read(p_Frame, &p_Dq->fd);
         if (p_QmPortal->options & QMAN_PORTAL_FLAG_DCA)
         {
             qmPortalDqrrDcaConsume1ptr(p_QmPortal->p_LowQmPortal,
@@ -1792,6 +2112,12 @@ t_Error QM_PORTAL_AddPoolChannel(t_Handle h_QmPortal, uint8_t poolChannelId)
     sdqcrFlags |= QM_SDQCR_CHANNELS_POOL(poolChannelId+1);
     qm_dqrr_sdqcr_set(p_QmPortal->p_LowQmPortal, sdqcrFlags);
 
+#ifdef __aarch64__
+    XX_Print("QM_PORTAL_AddPoolChannel: cpu=%d poolCh=%u SDQCR=0x%08x\n",
+        p_QmPortal->p_LowQmPortal->config.cpu,
+        (unsigned)poolChannelId, sdqcrFlags);
+#endif
+
     return E_OK;
 }
 
@@ -1820,6 +2146,51 @@ t_Error QM_PORTAL_Poll(t_Handle h_QmPortal, e_QmPortalPollSource source)
     return E_OK;
 }
 
+#ifdef __aarch64__
+/*
+ * Read DQRR state from hardware for diagnostics.
+ * Returns software PI/CI/fill and hardware PI/CI registers.
+ */
+void QM_PORTAL_DqrrDiag(t_Handle h_QmPortal, uint8_t *sw_pi, uint8_t *sw_ci,
+    uint8_t *sw_fill, uint8_t *hw_pi, uint8_t *hw_ci)
+{
+    t_QmPortal *p_QmPortal = (t_QmPortal *)h_QmPortal;
+    struct qm_portal *portal = p_QmPortal->p_LowQmPortal;
+    struct qm_dqrr *dqrr = &portal->dqrr;
+
+    *sw_pi = dqrr->pi;
+    *sw_ci = dqrr->ci;
+    *sw_fill = dqrr->fill;
+    *hw_pi = (uint8_t)(qm_in(DQRR_PI_CINH) & (QM_DQRR_SIZE - 1));
+    *hw_ci = (uint8_t)(qm_in(DQRR_CI_CINH) & (QM_DQRR_SIZE - 1));
+}
+
+void QM_PORTAL_IsrDiag(t_Handle h_QmPortal, uint32_t *isr, uint32_t *ier,
+    uint32_t *iir)
+{
+    t_QmPortal *p = (t_QmPortal *)h_QmPortal;
+
+    *isr = qm_isr_status_read(p->p_LowQmPortal);
+    *ier = qm_isr_enable_read(p->p_LowQmPortal);
+    *iir = __qm_isr_read(p->p_LowQmPortal, qm_isr_inhibit);
+}
+
+void QM_PORTAL_Inhibit(t_Handle h_QmPortal)
+{
+    t_QmPortal *p = (t_QmPortal *)h_QmPortal;
+
+    qm_isr_inhibit(p->p_LowQmPortal);
+}
+
+void QM_PORTAL_Uninhibit(t_Handle h_QmPortal)
+{
+    t_QmPortal *p = (t_QmPortal *)h_QmPortal;
+
+    qm_isr_status_clear(p->p_LowQmPortal, 0xffffffff);
+    qm_isr_uninhibit(p->p_LowQmPortal);
+}
+#endif
+
 t_Error QM_PORTAL_PollFrame(t_Handle h_QmPortal, t_QmPortalFrameInfo *p_frameInfo)
 {
     t_QmPortal              *p_QmPortal     = (t_QmPortal *)h_QmPortal;
@@ -1842,21 +2213,21 @@ t_Error QM_PORTAL_PollFrame(t_Handle h_QmPortal, t_QmPortalFrameInfo *p_frameInf
         PUNLOCK(p_QmPortal);
         return ERROR_CODE(E_EMPTY);
     }
-    p_Fq = ptr_from_aligned_int(p_Dq->contextB);
-    ASSERT_COND(p_Dq->fqid);
+    p_Fq = ptr_from_aligned_int(GET_UINT32(p_Dq->contextB));
+    ASSERT_COND(GET_UINT32(p_Dq->fqid));
     if (p_Fq)
     {
         p_frameInfo->h_App = p_Fq->h_App;
         p_frameInfo->h_QmFqr = p_Fq->h_QmFqr;
         p_frameInfo->fqidOffset = p_Fq->fqidOffset;
-        memcpy((void*)&p_frameInfo->frame, (void*)&p_Dq->fd, sizeof(t_DpaaFD));
+        qm_fd_read(&p_frameInfo->frame, &p_Dq->fd);
     }
     else
     {
         p_frameInfo->h_App = p_QmPortal->h_App;
         p_frameInfo->h_QmFqr = NULL;
-        p_frameInfo->fqidOffset = p_Dq->fqid;
-        memcpy((void*)&p_frameInfo->frame, (void*)&p_Dq->fd, sizeof(t_DpaaFD));
+        p_frameInfo->fqidOffset = GET_UINT32(p_Dq->fqid);
+        qm_fd_read(&p_frameInfo->frame, &p_Dq->fd);
     }
     if (p_QmPortal->options & QMAN_PORTAL_FLAG_DCA) {
         qmPortalDqrrDcaConsume1ptr(p_QmPortal->p_LowQmPortal,
@@ -2138,7 +2509,6 @@ t_Error QM_FQR_Enqueue(t_Handle h_QmFqr, t_Handle h_QmPortal, uint32_t fqidOffse
     t_QmFqr                 *p_QmFqr = (t_QmFqr *)h_QmFqr;
     t_QmPortal              *p_QmPortal;
     struct qm_eqcr_entry    *p_Eq;
-    uint32_t                *p_Dst, *p_Src;
     const struct qman_fq    *p_Fq;
 
     SANITY_CHECK_RETURN_ERROR(p_QmFqr, E_INVALID_HANDLE);
@@ -2171,23 +2541,40 @@ t_Error QM_FQR_Enqueue(t_Handle h_QmFqr, t_Handle h_QmPortal, uint32_t fqidOffse
         return ERROR_CODE(E_BUSY);
     }
 
-    p_Eq->fqid = p_Fq->fqid;
-    p_Eq->tag = aligned_int_from_ptr(p_Fq);
-    /* gcc does a dreadful job of the following;
-     *  eq->fd = *fd;
-     * It causes the entire function to save/restore a wider range of
-     * registers, and comes up with instruction-waste galore. This will do
-     * until we can rework the function for better code-generation. */
-    p_Dst = (uint32_t *)&p_Eq->fd;
-    p_Src = (uint32_t *)p_Frame;
-    p_Dst[0] = p_Src[0];
-    p_Dst[1] = p_Src[1];
-    p_Dst[2] = p_Src[2];
-    p_Dst[3] = p_Src[3];
+    WRITE_UINT32(p_Eq->fqid, p_Fq->fqid);
+    WRITE_UINT32(p_Eq->tag, aligned_int_from_ptr(p_Fq));
+    qm_fd_write(&p_Eq->fd, p_Frame);
 
     qmPortalEqcrPvbCommit(p_QmPortal->p_LowQmPortal,
                           (uint8_t)(QM_EQCR_VERB_CMD_ENQUEUE/* |
                           (flags & (QM_EQCR_VERB_COLOUR_MASK | QM_EQCR_VERB_INTERRUPT))*/));
+    PUNLOCK(p_QmPortal);
+
+    return E_OK;
+}
+
+t_Error QM_PORTAL_EnqueueFqid(t_Handle h_QmPortal, uint32_t fqid, t_DpaaFD *p_Frame)
+{
+    t_QmPortal              *p_QmPortal;
+    struct qm_eqcr_entry    *p_Eq;
+
+    SANITY_CHECK_RETURN_ERROR(h_QmPortal, E_INVALID_HANDLE);
+    p_QmPortal = (t_QmPortal *)h_QmPortal;
+
+    NCSW_PLOCK(p_QmPortal);
+    p_Eq = try_eq_start(p_QmPortal);
+    if (!p_Eq)
+    {
+        PUNLOCK(p_QmPortal);
+        return ERROR_CODE(E_BUSY);
+    }
+
+    WRITE_UINT32(p_Eq->fqid, fqid);
+    WRITE_UINT32(p_Eq->tag, 0);
+    qm_fd_write(&p_Eq->fd, p_Frame);
+
+    qmPortalEqcrPvbCommit(p_QmPortal->p_LowQmPortal,
+                          (uint8_t)QM_EQCR_VERB_CMD_ENQUEUE);
     PUNLOCK(p_QmPortal);
 
     return E_OK;

@@ -52,7 +52,8 @@
 
 #define IP_OFFLOAD_PACKAGE_NUMBER                   106
 #define CAPWAP_OFFLOAD_PACKAGE_NUMBER               108
-#define IS_OFFLOAD_PACKAGE(num) ((num == IP_OFFLOAD_PACKAGE_NUMBER) || (num == CAPWAP_OFFLOAD_PACKAGE_NUMBER))
+#define ASK_UCODE_PACKAGE_NUMBER                    209
+#define IS_OFFLOAD_PACKAGE(num) ((num == IP_OFFLOAD_PACKAGE_NUMBER) || (num == CAPWAP_OFFLOAD_PACKAGE_NUMBER) || (num >= ASK_UCODE_PACKAGE_NUMBER))
 
 
 
@@ -189,7 +190,13 @@ typedef _Packed struct t_FmPcdCtrlParamsPage {
     volatile uint32_t discardMask;
     volatile uint8_t  reserved3[4];
     volatile uint32_t postBmiFetchNia;
+#if (DPAA_VERSION >= 11)
+    volatile uint32_t internalFEBufferManagementIndexAddr;
+    volatile uint32_t internalFEBufferDepletionCounter;
+    volatile uint8_t  reserved4[164];
+#else
     volatile uint8_t  reserved4[172];
+#endif
 } _PackedType t_FmPcdCtrlParamsPage;
 
 

@@ -52,6 +52,9 @@ device		pca954x		# NXP PCA9545/9546/9548 I2C mux/switch
 # GPIO power-off (STUSB4500 USB-C PD reset)
 device		gpiopower
 
+# DPAA1 (FMan/QMan/BMan) -- NXP LS1046A packet acceleration
+include		"dpaa/config.dpaa_arm64"
+device		dpaa
 device		sff			# Small Form Factor Transceivers (SFP+)
 
 # caam is built as an out-of-tree module in opnsense-deps/drivers/caam/

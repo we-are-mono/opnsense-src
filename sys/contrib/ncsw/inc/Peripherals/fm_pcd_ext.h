@@ -39,6 +39,10 @@
 #ifndef __FM_PCD_EXT
 #define __FM_PCD_EXT
 
+/* CDX enhanced external hash tables — redirect FM_PCD_HashTable* APIs
+ * to ExternalHashTable* implementations (matching Linux SDK). */
+#define USE_ENHANCED_EHASH 1
+
 #include "std_ext.h"
 #include "net_ext.h"
 #include "list_ext.h"
@@ -1718,6 +1722,8 @@ typedef struct t_FmPcdKgSchemeParams {
         uint8_t                         relativeSchemeId;       /**< if modify=FALSE:Partition relative scheme id */
         t_Handle                        h_Scheme;               /**< if modify=TRUE: a handle of the existing scheme */
     } id;
+    bool                                shared;                 /**< This scheme is shared between ports
+                                                                     (must match ioc_fm_pcd_kg_scheme_params_t layout) */
     bool                                alwaysDirect;           /**< This scheme is reached only directly, i.e. no need
                                                                      for match vector; KeyGen will ignore it when matching */
     struct {                                                    /**< HL Relevant only if alwaysDirect = FALSE */
@@ -1991,6 +1997,34 @@ typedef struct t_FmPcdHashTableParams {
 
     t_FmPcdCcNextEngineParams   ccNextEngineParamsForMiss;  /**< Parameters for defining the next engine when a key is not matched */
 
+    bool                        agingSupport;               /**< TRUE to enable aging support for all keys of this
+                                                                 hash table; allows monitoring whether a key was
+                                                                 accessed during a given period. */
+
+#if (DPAA_VERSION >= 11)
+    bool                        externalHash;               /**< TRUE to use external hash table (CDX manages
+                                                                 the hash buckets in DDR; NCSW only allocates the
+                                                                 MURAM AD placeholder). */
+
+#ifndef EXCLUDE_FMAN_IPR_OFFLOAD
+    uint32_t                    table_type;                 /**< IP reassembly table type
+                                                                 (must match ioc_fm_pcd_hash_table_params_t layout) */
+    struct {
+        uint32_t                timeout_val;                /**< reassembly timeout */
+        uint32_t                timeout_fqid;               /**< fqid for reassembly failures */
+        uint32_t                max_frags;                  /**< max allowed fragments */
+        uint32_t                min_frag_size;              /**< min allowed frag size except last frag */
+        uint32_t                max_sessions;               /**< max conn reassembly sessions */
+    };
+#endif /* EXCLUDE_FMAN_IPR_OFFLOAD */
+
+    struct {
+        uint8_t                 dataMemId;                  /**< Memory partition ID for external hash table
+                                                                 buckets and contexts; must not cross 4GB boundary */
+        uint16_t                dataLiodnOffs;              /**< LIODN offset for external hash table access */
+        uintptr_t               missMonitorAddr;            /**< User-allocated miss monitor address */
+    } externalHashParams;
+#endif /* (DPAA_VERSION >= 11) */
 } t_FmPcdHashTableParams;
 
 /**************************************************************************//**

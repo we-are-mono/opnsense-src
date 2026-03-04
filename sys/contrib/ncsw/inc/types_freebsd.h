@@ -36,7 +36,7 @@
 #include <machine/pio.h>
 
 #if !defined(__bool_true_false_are_defined)
-typedef	boolean_t	bool;
+typedef	_Bool		bool;
 #endif
 #define	TRUE		1
 #define	FALSE		0
@@ -48,22 +48,39 @@ typedef vm_paddr_t	physAddress_t;
 
 /**
  * Accessor defines.
- * TODO: These are only stubs and have to be redefined (use bus_space
- * facilities).
+ * DPAA1 registers are big-endian.  On PowerPC (big-endian), native
+ * in32/out32 match.  On ARM64 (little-endian), use the reverse-byte
+ * variants (in32rb/out32rb) to byte-swap.
  */
+#ifdef __aarch64__
+#define GET_UINT32(arg)			in32rb(&(arg))
+#define GET_UINT64(arg)			in64(&(arg))
+
+#define _WRITE_UINT32(arg, data)	out32rb(&(arg), (data))
+#define _WRITE_UINT64(arg, data)	out64(&(arg), (data))
+#else
 #define GET_UINT32(arg)			in32(&(arg))
 #define GET_UINT64(arg)			in64(&(arg))
 
 #define _WRITE_UINT32(arg, data)	out32(&(arg), (data))
 #define _WRITE_UINT64(arg, data)	out64(&(arg), (data))
+#endif
 
 #ifndef QE_32_BIT_ACCESS_RESTRICTION
 
+#ifdef __aarch64__
+#define GET_UINT8(arg)			in8(&(arg))
+#define GET_UINT16(arg)			in16rb(&(arg))
+
+#define _WRITE_UINT8(arg, data)		out8(&(arg), (data))
+#define _WRITE_UINT16(arg, data)	out16rb(&(arg), (data))
+#else
 #define GET_UINT8(arg)			in8(&(arg))
 #define GET_UINT16(arg)			in16(&(arg))
 
 #define _WRITE_UINT8(arg, data)		out8(&(arg), (data))
 #define _WRITE_UINT16(arg, data)	out16(&(arg), (data))
+#endif
 
 #else  /* QE_32_BIT_ACCESS_RESTRICTION */
 

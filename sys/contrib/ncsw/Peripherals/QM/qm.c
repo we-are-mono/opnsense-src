@@ -295,9 +295,9 @@ static uint32_t ReserveFqids(t_Qm *p_Qm, uint32_t size, uint32_t alignment, bool
 
 static void FreeInitResources(t_Qm *p_Qm)
 {
-    if (p_Qm->p_FqdBase)
+    if (p_Qm->p_FqdBase && !p_Qm->fqdExternal)
         XX_FreeSmart(p_Qm->p_FqdBase);
-    if (p_Qm->p_PfdrBase)
+    if (p_Qm->p_PfdrBase && !p_Qm->pfdrExternal)
         XX_FreeSmart(p_Qm->p_PfdrBase);
     if (p_Qm->h_Session)
         XX_IpcFreeSession(p_Qm->h_Session);
@@ -705,6 +705,10 @@ t_Handle QM_Config(t_QmParam *p_QmParam)
         p_Qm->p_QmDriverParams->pfdrThreshold           = DEFAULT_pfdrThreshold;
         p_Qm->p_QmDriverParams->sfdrThreshold           = DEFAULT_sfdrThreshold;
         p_Qm->p_QmDriverParams->pfdrBaseConstant        = DEFAULT_pfdrBaseConstant;
+        p_Qm->p_QmDriverParams->p_FqdBaseExt           = p_QmParam->p_FqdBase;
+        p_Qm->p_QmDriverParams->fqdSizeExt             = p_QmParam->fqdSize;
+        p_Qm->p_QmDriverParams->p_PfdrBaseExt          = p_QmParam->p_PfdrBase;
+        p_Qm->p_QmDriverParams->pfdrSizeExt            = p_QmParam->pfdrSize;
         for(i= 0;i<DPAA_MAX_NUM_OF_DC_PORTALS;i++)
             p_Qm->p_QmDriverParams->dcPortalsParams[i].sendToSw =
                 (bool)((i < e_DPAA_DCPORTAL2) ? FALSE : TRUE);
@@ -774,19 +778,32 @@ t_Error QM_Init(t_Handle h_Qm)
         WRITE_UINT32(p_Qm->p_QmRegs->liodnr, (uint16_t)p_QmDriverParams->liodn);
 
         /* FQD memory */
-        dsSize = (uint32_t)(p_QmDriverParams->totalNumOfFqids * FQD_ENTRY_SIZE);
-        LOG2(dsSize, exp);
-        if (!POWER_OF_2(dsSize)) (exp++);
-        dsSize = (uint32_t)(1 << exp);
-        if (dsSize < (4*KILOBYTE))
+        if (p_QmDriverParams->p_FqdBaseExt)
         {
-            dsSize = (4*KILOBYTE);
+            /* Use pre-allocated FQD memory from caller (e.g. DT reserved-memory) */
+            p_Qm->p_FqdBase = p_QmDriverParams->p_FqdBaseExt;
+            p_Qm->fqdExternal = TRUE;
+            dsSize = p_QmDriverParams->fqdSizeExt;
             LOG2(dsSize, exp);
+            if (!POWER_OF_2(dsSize)) (exp++);
+            dsSize = (uint32_t)(1 << exp);
         }
-        p_Qm->p_FqdBase = XX_MallocSmart(dsSize, (int)p_QmDriverParams->fqdMemPartitionId, dsSize);
-        if (!p_Qm->p_FqdBase)
+        else
         {
-            RETURN_ERROR(MAJOR, E_NO_MEMORY, ("FQD obj!!!"));
+            dsSize = (uint32_t)(p_QmDriverParams->totalNumOfFqids * FQD_ENTRY_SIZE);
+            LOG2(dsSize, exp);
+            if (!POWER_OF_2(dsSize)) (exp++);
+            dsSize = (uint32_t)(1 << exp);
+            if (dsSize < (4*KILOBYTE))
+            {
+                dsSize = (4*KILOBYTE);
+                LOG2(dsSize, exp);
+            }
+            p_Qm->p_FqdBase = XX_MallocSmart(dsSize, (int)p_QmDriverParams->fqdMemPartitionId, dsSize);
+            if (!p_Qm->p_FqdBase)
+            {
+                RETURN_ERROR(MAJOR, E_NO_MEMORY, ("FQD obj!!!"));
+            }
         }
         memset(p_Qm->p_FqdBase, 0, dsSize);
 	mb();
@@ -799,28 +816,66 @@ t_Error QM_Init(t_Handle h_Qm)
         WRITE_UINT32(p_Qm->p_QmRegs->fqd_bar, (uint32_t)phyAddr);
         WRITE_UINT32(p_Qm->p_QmRegs->fqd_ar, AR_ENABLE | (exp - 1));
 
-        /* PFDR memory */
-        dsSize = (uint32_t)(p_QmDriverParams->rtFramesDepth * (PFDR_ENTRY_SIZE/3));
-        LOG2(dsSize, exp);
-        if (!POWER_OF_2(dsSize)) (exp++);
-        dsSize = (uint32_t)(1 << exp);
-        if (dsSize < (4*KILOBYTE))
+        /* Readback and verify FQD BAR programming */
         {
-            dsSize = (4*KILOBYTE);
-            LOG2(dsSize, exp);
+            uint32_t rb_bare = GET_UINT32(p_Qm->p_QmRegs->fqd_bare);
+            uint32_t rb_bar  = GET_UINT32(p_Qm->p_QmRegs->fqd_bar);
+            uint32_t rb_ar   = GET_UINT32(p_Qm->p_QmRegs->fqd_ar);
+            XX_Print("QM FQD: va=%p phys=0x%08x%08x bare=0x%08x bar=0x%08x ar=0x%08x (exp=%d, size=0x%x)\n",
+                p_Qm->p_FqdBase,
+                (uint32_t)(phyAddr >> 32), (uint32_t)phyAddr,
+                rb_bare, rb_bar, rb_ar, exp, dsSize);
         }
 
-        p_Qm->p_PfdrBase = XX_MallocSmart(dsSize, (int)p_QmDriverParams->pfdrMemPartitionId, dsSize);
-        if (!p_Qm->p_PfdrBase)
-            RETURN_ERROR(MAJOR, E_NO_MEMORY, ("PFDR obj!!!"));
+        /* PFDR memory */
+        if (p_QmDriverParams->p_PfdrBaseExt)
+        {
+            /* Use pre-allocated PFDR memory from caller */
+            p_Qm->p_PfdrBase = p_QmDriverParams->p_PfdrBaseExt;
+            p_Qm->pfdrExternal = TRUE;
+            dsSize = p_QmDriverParams->pfdrSizeExt;
+            LOG2(dsSize, exp);
+            if (!POWER_OF_2(dsSize)) (exp++);
+            dsSize = (uint32_t)(1 << exp);
+        }
+        else
+        {
+            dsSize = (uint32_t)(p_QmDriverParams->rtFramesDepth * (PFDR_ENTRY_SIZE/3));
+            LOG2(dsSize, exp);
+            if (!POWER_OF_2(dsSize)) (exp++);
+            dsSize = (uint32_t)(1 << exp);
+            if (dsSize < (4*KILOBYTE))
+            {
+                dsSize = (4*KILOBYTE);
+                LOG2(dsSize, exp);
+            }
+            p_Qm->p_PfdrBase = XX_MallocSmart(dsSize, (int)p_QmDriverParams->pfdrMemPartitionId, dsSize);
+            if (!p_Qm->p_PfdrBase)
+                RETURN_ERROR(MAJOR, E_NO_MEMORY, ("PFDR obj!!!"));
+        }
 
         phyAddr = XX_VirtToPhys(p_Qm->p_PfdrBase);
         WRITE_UINT32(p_Qm->p_QmRegs->pfdr_bare, ((uint32_t)(phyAddr >> 32) & 0x000000ff));
         WRITE_UINT32(p_Qm->p_QmRegs->pfdr_bar, (uint32_t)phyAddr);
         WRITE_UINT32(p_Qm->p_QmRegs->pfdr_ar, AR_ENABLE | (exp - 1));
 
+        /* Readback and verify PFDR BAR programming */
+        {
+            uint32_t rb_bare = GET_UINT32(p_Qm->p_QmRegs->pfdr_bare);
+            uint32_t rb_bar  = GET_UINT32(p_Qm->p_QmRegs->pfdr_bar);
+            uint32_t rb_ar   = GET_UINT32(p_Qm->p_QmRegs->pfdr_ar);
+            XX_Print("QM PFDR: va=%p phys=0x%08x%08x bare=0x%08x bar=0x%08x ar=0x%08x (exp=%d, size=0x%x)\n",
+                p_Qm->p_PfdrBase,
+                (uint32_t)(phyAddr >> 32), (uint32_t)phyAddr,
+                rb_bare, rb_bar, rb_ar, exp, dsSize);
+            XX_Print("QM PFDR init: pfdr_start=8, num=%d\n", dsSize / 64 - 8);
+        }
+
         if (QmInitPfdr(p_Qm, 8, dsSize / 64 - 8) != E_OK)
             RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PFDR init failed!!!"));
+
+        XX_Print("QM PFDR init: SUCCESS, pfdr_fpc=%d\n",
+            GET_UINT32(p_Qm->p_QmRegs->pfdr_fpc));
 
         /* thresholds */
         WRITE_UINT32(p_Qm->p_QmRegs->pfdr_fp_lwit, (p_Qm->p_QmDriverParams->pfdrThreshold & 0xffffff));
@@ -1036,6 +1091,27 @@ uint32_t QM_GetCounter(t_Handle h_Qm, e_QmCounters counter)
 
     return 0;
 }
+
+#ifdef __aarch64__
+void QM_ErrorDiag(t_Handle h_Qm, uint32_t *err_isr, uint32_t *ecsr,
+    uint32_t *ecir, uint32_t *pfdr_fpc, uint32_t *sfdr_in_use,
+    uint32_t *idle_stat, uint32_t *dcp0_cfg, uint32_t *dcp0_dlm_avg,
+    uint32_t *dcp_dd_ihrsr, uint32_t *dcp_dd_hasr)
+{
+    t_Qm *p_Qm = (t_Qm *)h_Qm;
+
+    *err_isr     = GET_UINT32(p_Qm->p_QmRegs->err_isr);
+    *ecsr        = GET_UINT32(p_Qm->p_QmRegs->ecsr);
+    *ecir        = GET_UINT32(p_Qm->p_QmRegs->ecir);
+    *pfdr_fpc    = GET_UINT32(p_Qm->p_QmRegs->pfdr_fpc);
+    *sfdr_in_use = GET_UINT32(p_Qm->p_QmRegs->sfdr_in_use);
+    *idle_stat   = GET_UINT32(p_Qm->p_QmRegs->idle_stat);
+    *dcp0_cfg    = GET_UINT32(p_Qm->p_QmRegs->dcpConfRegs[0].cfg);
+    *dcp0_dlm_avg = GET_UINT32(p_Qm->p_QmRegs->dcpConfRegs[0].dlm_avg);
+    *dcp_dd_ihrsr = GET_UINT32(p_Qm->p_QmRegs->dcp_dd_ihrsr);
+    *dcp_dd_hasr  = GET_UINT32(p_Qm->p_QmRegs->dcp_dd_hasr);
+}
+#endif
 
 void QM_ErrorIsr(t_Handle h_Qm)
 {

@@ -1462,6 +1462,11 @@ t_Error FM_GetFmanCtrlCodeRevision(t_Handle h_Fm, t_FmCtrlCodeRevisionInfo *p_Re
 *//***************************************************************************/
 uint32_t  FM_GetCounter(t_Handle h_Fm, e_FmCounters counter);
 
+#ifdef __aarch64__
+void FM_ErrorDiag(t_Handle h_Fm, uint8_t hwPortId);
+void FM_TaskStatusDiag(t_Handle h_Fm, uint8_t hwPortId);
+#endif
+
 /**************************************************************************//**
  @Function      FM_ModifyCounter
 

@@ -35,9 +35,6 @@
  @File          arm_ext.h
 
  @Description   Core API for ARM cores
-
-                These routines must be implemented by each specific PowerPC
-                core driver.
 *//***************************************************************************/
 #ifndef __ARM_EXT_H
 #define __ARM_EXT_H
@@ -52,4 +49,28 @@ static __inline__ void CORE_MemoryBarrier(void)
 	mb();
 }
 
-#endif /* __PPC_EXT_H */
+#if defined(NCSW_ARM_CORE) && defined(NCSW_FREEBSD)
+/*
+ * FreeBSD ARM64 core function bindings.
+ * Implementations are in core_arm64.c.
+ *
+ * Follow the same pattern as PPC: e500v2_ext.h defines
+ * CORE_GetId -> E500_GetId, etc.  We map to ARM64_* equivalents.
+ */
+
+uint32_t ARM64_GetId(void);
+int ARM64_TestAndSet(volatile int *p);
+void ARM64_InstructionSync(void);
+
+#define CORE_GetId		ARM64_GetId
+#define CORE_TestAndSet		ARM64_TestAndSet
+#define CORE_InstructionSync	ARM64_InstructionSync
+
+/* Cache management — handled by the kernel on ARM64, no-ops here */
+#define CORE_DCacheEnable()	do { } while (0)
+#define CORE_ICacheEnable()	do { } while (0)
+#define CORE_DCacheDisable()	do { } while (0)
+#define CORE_ICacheDisable()	do { } while (0)
+#endif /* NCSW_ARM_CORE && NCSW_FREEBSD */
+
+#endif /* __ARM_EXT_H */

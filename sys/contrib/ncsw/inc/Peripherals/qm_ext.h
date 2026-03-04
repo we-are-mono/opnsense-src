@@ -1,6 +1,6 @@
 /******************************************************************************
 
- © 1995-2003, 2004, 2005-2011 Freescale Semiconductor, Inc.
+ ï¿½ 1995-2003, 2004, 2005-2011 Freescale Semiconductor, Inc.
  All rights reserved.
 
  This is proprietary source code of Freescale Semiconductor Inc.,
@@ -258,6 +258,13 @@ typedef struct {
                                                          NOTE: this parameter relevant only when working with multiple partitions. */
     uint16_t                partNumOfCgs;           /**< Number of cgr's dedicated to this partition.
                                                          NOTE: this parameter relevant only when working with multiple partitions. */
+    void                    *p_FqdBase;             /**< Pre-allocated FQD memory (virtual), or NULL for internal allocation.
+                                                         Must be physically contiguous, naturally aligned, and non-cacheable.
+                                                         When set, totalNumOfFqids is computed from fqdSize / 64. */
+    uint32_t                fqdSize;                /**< Size of pre-allocated FQD memory in bytes. */
+    void                    *p_PfdrBase;            /**< Pre-allocated PFDR memory (virtual), or NULL for internal allocation.
+                                                         Must be physically contiguous, naturally aligned, and non-cacheable. */
+    uint32_t                pfdrSize;               /**< Size of pre-allocated PFDR memory in bytes. */
 } t_QmParam;
 
 
@@ -791,6 +798,40 @@ typedef struct t_QmPortalFrameInfo {
 *//***************************************************************************/
 t_Error QM_PORTAL_Poll(t_Handle h_QmPortal, e_QmPortalPollSource source);
 
+#ifdef __aarch64__
+void QM_PORTAL_DqrrDiag(t_Handle h_QmPortal, uint8_t *sw_pi, uint8_t *sw_ci,
+    uint8_t *sw_fill, uint8_t *hw_pi, uint8_t *hw_ci);
+void QM_PORTAL_IsrDiag(t_Handle h_QmPortal, uint32_t *isr, uint32_t *ier,
+    uint32_t *iir);
+
+void QM_ErrorDiag(t_Handle h_Qm, uint32_t *err_isr, uint32_t *ecsr,
+    uint32_t *ecir, uint32_t *pfdr_fpc, uint32_t *sfdr_in_use,
+    uint32_t *idle_stat, uint32_t *dcp0_cfg, uint32_t *dcp0_dlm_avg,
+    uint32_t *dcp_dd_ihrsr, uint32_t *dcp_dd_hasr);
+
+/**************************************************************************//**
+ @Function      QM_PORTAL_Inhibit
+
+ @Description   Inhibit all interrupts for this portal (IIR=1).
+                Used by NAPI-style FILTER handler to mask interrupts
+                at the source before scheduling deferred processing.
+
+ @Param[in]     h_QmPortal      - A handle to a QM-Portal module
+*//***************************************************************************/
+void QM_PORTAL_Inhibit(t_Handle h_QmPortal);
+
+/**************************************************************************//**
+ @Function      QM_PORTAL_Uninhibit
+
+ @Description   Clear all pending ISR status and uninhibit portal
+                interrupts (IIR=0).  Called after draining DQRR/MR
+                to re-enable interrupt delivery.
+
+ @Param[in]     h_QmPortal      - A handle to a QM-Portal module
+*//***************************************************************************/
+void QM_PORTAL_Uninhibit(t_Handle h_QmPortal);
+#endif
+
 /**************************************************************************//**
  @Function      QM_PORTAL_PollFrame
 
@@ -1057,6 +1098,21 @@ uint32_t QM_FQR_GetCounter(t_Handle h_QmFqr, t_Handle h_QmPortal, uint32_t fqidO
  @Cautions      Allowed only following QM_FQR_Create().
 *//***************************************************************************/
 t_Error QM_FQR_Enqueue(t_Handle h_QmFqr, t_Handle h_QmPortal, uint32_t fqidOffset, t_DpaaFD *p_Frame);
+
+/**************************************************************************//**
+ @Function      QM_PORTAL_EnqueueFqid
+
+ @Description   Enqueue a frame to a specific FQID without requiring an FQR
+                handle.  Used for CEETM frame queues which are managed by
+                CEETM hardware rather than NCSW FQR.
+
+ @Param[in]     h_QmPortal      - A handle to a QM Portal Module.
+ @Param[in]     fqid            - The target Frame Queue ID.
+ @Param[in]     p_Frame         - Pointer to the frame to enqueue.
+
+ @Return        E_OK on success; Error code otherwise.
+*//***************************************************************************/
+t_Error QM_PORTAL_EnqueueFqid(t_Handle h_QmPortal, uint32_t fqid, t_DpaaFD *p_Frame);
 
 /**************************************************************************//**
  @Function      QM_FQR_PullFrame

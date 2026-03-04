@@ -51,6 +51,30 @@
 /***************************/
 
 /* Cache-inhibited register offsets */
+#if defined(__aarch64__)
+/*
+ * ARM64 Layerscape (LS1046A etc.): CI space is 16KB per portal.
+ * Register offsets differ from PowerPC.
+ * See Linux drivers/soc/fsl/qbman/qman.c for reference.
+ */
+#define REG_EQCR_PI_CINH    0x3000
+#define REG_EQCR_CI_CINH    0x3040
+#define REG_EQCR_ITR        0x3080
+#define REG_DQRR_PI_CINH    0x3100
+#define REG_DQRR_CI_CINH    0x3140
+#define REG_DQRR_ITR        0x3180
+#define REG_DQRR_DCAP       0x31C0
+#define REG_DQRR_SDQCR      0x3200
+#define REG_DQRR_VDQCR      0x3240
+#define REG_DQRR_PDQCR      0x3280
+#define REG_MR_PI_CINH      0x3300
+#define REG_MR_CI_CINH      0x3340
+#define REG_MR_ITR          0x3380
+#define REG_CFG             0x3500
+#define REG_ISR             0x3600
+#define REG_ITPR            0x3740
+#define QM_ISR_SHIFT        6       /* ISR/IER/ISDR/IIR stride: 64 bytes */
+#else /* PowerPC */
 #define REG_EQCR_PI_CINH    0x0000
 #define REG_EQCR_CI_CINH    0x0004
 #define REG_EQCR_ITR        0x0008
@@ -66,22 +90,29 @@
 #define REG_MR_ITR          0x0088
 #define REG_CFG             0x0100
 #define REG_ISR             0x0e00
-#define REG_IER             0x0e04
-#define REG_ISDR            0x0e08
-#define REG_IIR             0x0e0c
 #define REG_ITPR            0x0e14
+#define QM_ISR_SHIFT        2       /* ISR/IER/ISDR/IIR stride: 4 bytes */
+#endif
 
 /* Cache-enabled register offsets */
 #define CL_EQCR             0x0000
 #define CL_DQRR             0x1000
 #define CL_MR               0x2000
 #define CL_EQCR_PI_CENA     0x3000
+#if defined(__aarch64__)
+#define CL_EQCR_CI_CENA     0x3040
+#define CL_DQRR_PI_CENA     0x3100
+#define CL_DQRR_CI_CENA     0x3140
+#define CL_MR_PI_CENA       0x3300
+#define CL_MR_CI_CENA       0x3340
+#else /* PowerPC */
 #define CL_EQCR_CI_CENA     0x3100
 #define CL_DQRR_PI_CENA     0x3200
 #define CL_DQRR_CI_CENA     0x3300
 #define CL_MR_PI_CENA       0x3400
 #define CL_MR_CI_CENA       0x3500
 #define CL_RORI_CENA        0x3600
+#endif
 #define CL_CR               0x3800
 #define CL_RR0              0x3900
 #define CL_RR1              0x3940
@@ -300,11 +331,18 @@ static __inline__ struct qm_eqcr_entry *qm_eqcr_pend_and_next(struct qm_portal *
 }
 
 #ifdef QM_CHECKING
+/*
+ * EQCR entries live in CE portal memory (big-endian on hardware).
+ * On ARM64, WRITE_UINT32 byte-swaps values for the hardware, so we
+ * must use GET_UINT32 to read them back in host order for validation.
+ */
 #define EQCR_COMMIT_CHECKS(eqcr) \
 do { \
     ASSERT_COND(eqcr->busy); \
-    ASSERT_COND(eqcr->cursor->orp == (eqcr->cursor->orp & 0x00ffffff)); \
-    ASSERT_COND(eqcr->cursor->fqid == (eqcr->cursor->fqid & 0x00ffffff)); \
+    ASSERT_COND(GET_UINT32(eqcr->cursor->orp) == \
+        (GET_UINT32(eqcr->cursor->orp) & 0x00ffffff)); \
+    ASSERT_COND(GET_UINT32(eqcr->cursor->fqid) == \
+        (GET_UINT32(eqcr->cursor->fqid) & 0x00ffffff)); \
 } while(0)
 
 #else
@@ -878,6 +916,7 @@ static __inline__ void qm_mr_current_prefetch(struct qm_portal *portal)
 {
     register struct qm_mr *mr = &portal->mr;
     dcbt_ro(mr->cursor);
+    (void)mr;
 }
 
 static __inline__ struct qm_mr_entry *qm_mr_current(struct qm_portal *portal)
@@ -1139,10 +1178,10 @@ static __inline__ void qm_isr_set_iperiod(struct qm_portal *portal, uint16_t ipe
 
 static __inline__ uint32_t __qm_isr_read(struct qm_portal *portal, enum qm_isr_reg n)
 {
-    return __qm_in(&portal->addr, REG_ISR + (n << 2));
+    return __qm_in(&portal->addr, REG_ISR + (n << QM_ISR_SHIFT));
 }
 
 static __inline__ void __qm_isr_write(struct qm_portal *portal, enum qm_isr_reg n, uint32_t val)
 {
-    __qm_out(&portal->addr, REG_ISR + (n << 2), val);
+    __qm_out(&portal->addr, REG_ISR + (n << QM_ISR_SHIFT), val);
 }
