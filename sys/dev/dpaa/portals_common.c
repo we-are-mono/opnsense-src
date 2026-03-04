@@ -39,7 +39,12 @@
 #include <vm/pmap.h>
 
 #include <machine/resource.h>
+#ifdef __powerpc__
 #include <machine/tlb.h>
+#endif
+#ifdef __aarch64__
+#include <machine/pmap.h>
+#endif
 
 #include <contrib/ncsw/inc/error_ext.h>
 #include <contrib/ncsw/inc/xx_ext.h>
@@ -70,6 +75,11 @@ dpaa_portal_alloc_res(device_t dev, struct dpaa_portals_devinfo *di, int cpu)
 		/* Cache enabled area */
 		rle = resource_list_find(res, SYS_RES_MEMORY, 0);
 		sc->sc_rrid[0] = 0;
+		device_printf(dev, "CE alloc: pa=%#lx-%#lx size=%#lx dp_pa=%#lx\n",
+		    (unsigned long)(rle->start + sc->sc_dp_pa),
+		    (unsigned long)(rle->end + sc->sc_dp_pa),
+		    (unsigned long)rle->count,
+		    (unsigned long)sc->sc_dp_pa);
 		sc->sc_rres[0] = bus_alloc_resource(dev,
 		    SYS_RES_MEMORY, &sc->sc_rrid[0], rle->start + sc->sc_dp_pa,
 		    rle->end + sc->sc_dp_pa, rle->count, RF_ACTIVE);
@@ -78,11 +88,37 @@ dpaa_portal_alloc_res(device_t dev, struct dpaa_portals_devinfo *di, int cpu)
 			    "Could not allocate cache enabled memory.\n");
 			return (ENXIO);
 		}
+		device_printf(dev, "CE mapped: va=%#lx\n",
+		    (unsigned long)rman_get_bushandle(sc->sc_rres[0]));
+#ifdef __powerpc__
 		tlb1_set_entry(rman_get_bushandle(sc->sc_rres[0]),
 		    rle->start + sc->sc_dp_pa, rle->count, _TLB_ENTRY_MEM);
+#endif
+#ifdef __aarch64__
+		/*
+		 * ARM64: The CE portal region must be Normal Non-Cacheable.
+		 * Linux maps this as MEMREMAP_WC (pgprot_writecombine =
+		 * Normal-NC) on ARM64.  Stores go directly to the portal
+		 * hardware without cache involvement.  dc zva works on
+		 * Normal-NC (zeros written as burst), dc cvac is a no-op.
+		 */
+		pmap_change_attr(
+		    (vm_offset_t)rman_get_bushandle(sc->sc_rres[0]),
+		    rle->count, VM_MEMATTR_UNCACHEABLE);
+		device_printf(dev, "CE pa_verify: va=%#lx -> pa=%#lx "
+		    "(expected %#lx)\n",
+		    (unsigned long)rman_get_bushandle(sc->sc_rres[0]),
+		    (unsigned long)pmap_kextract(
+		        (vm_offset_t)rman_get_bushandle(sc->sc_rres[0])),
+		    (unsigned long)(rle->start + sc->sc_dp_pa));
+#endif
 		/* Cache inhibited area */
 		rle = resource_list_find(res, SYS_RES_MEMORY, 1);
 		sc->sc_rrid[1] = 1;
+		device_printf(dev, "CI alloc: pa=%#lx-%#lx size=%#lx\n",
+		    (unsigned long)(rle->start + sc->sc_dp_pa),
+		    (unsigned long)(rle->end + sc->sc_dp_pa),
+		    (unsigned long)rle->count);
 		sc->sc_rres[1] = bus_alloc_resource(dev,
 		    SYS_RES_MEMORY, &sc->sc_rrid[1], rle->start + sc->sc_dp_pa,
 		    rle->end + sc->sc_dp_pa, rle->count, RF_ACTIVE);
@@ -93,8 +129,16 @@ dpaa_portal_alloc_res(device_t dev, struct dpaa_portals_devinfo *di, int cpu)
 			    sc->sc_rrid[0], sc->sc_rres[0]);
 			return (ENXIO);
 		}
+		device_printf(dev, "CI mapped: va=%#lx\n",
+		    (unsigned long)rman_get_bushandle(sc->sc_rres[1]));
+#ifdef __powerpc__
 		tlb1_set_entry(rman_get_bushandle(sc->sc_rres[1]),
 		    rle->start + sc->sc_dp_pa, rle->count, _TLB_ENTRY_IO);
+#endif
+		sc->sc_dp[cpu].dp_ce_va =
+		    rman_get_bushandle(sc->sc_rres[0]);
+		sc->sc_dp[cpu].dp_ci_va =
+		    rman_get_bushandle(sc->sc_rres[1]);
 		sc->sc_dp[cpu].dp_regs_mapped = 1;
 	}
 	/* Acquire portal's CE_PA and CI_PA */
@@ -153,15 +197,64 @@ dpaa_portal_map_registers(struct dpaa_portals_softc *sc)
 	if (sc->sc_dp[cpu].dp_regs_mapped)
 		goto out;
 
+#ifdef __powerpc__
+	/* PowerPC: remap the shared VA to this CPU's portal PA via TLB */
 	tlb1_set_entry(rman_get_bushandle(sc->sc_rres[0]),
 	    sc->sc_dp[cpu].dp_ce_pa, sc->sc_dp[cpu].dp_ce_size,
 	    _TLB_ENTRY_MEM);
 	tlb1_set_entry(rman_get_bushandle(sc->sc_rres[1]),
 	    sc->sc_dp[cpu].dp_ci_pa, sc->sc_dp[cpu].dp_ci_size,
 	    _TLB_ENTRY_IO);
+	sc->sc_dp[cpu].dp_ce_va = rman_get_bushandle(sc->sc_rres[0]);
+	sc->sc_dp[cpu].dp_ci_va = rman_get_bushandle(sc->sc_rres[1]);
+#endif
+#ifdef __aarch64__
+	/*
+	 * ARM64: Each CPU needs its own VA→PA mapping because we can't
+	 * remap a shared VA per-CPU like PowerPC does with TLB1 entries.
+	 * Map each portal's CE as Normal Non-Cacheable, CI as Device.
+	 */
+	if (sc->sc_dp[cpu].dp_ce_pa == 0) {
+		printf("dpaa_portal_map_registers: cpu %u has no portal allocated\n", cpu);
+		goto out;
+	}
+	sc->sc_dp[cpu].dp_ce_va = (vm_offset_t)pmap_mapdev_attr(
+	    sc->sc_dp[cpu].dp_ce_pa, sc->sc_dp[cpu].dp_ce_size,
+	    VM_MEMATTR_UNCACHEABLE);
+	sc->sc_dp[cpu].dp_ci_va = (vm_offset_t)pmap_mapdev(
+	    sc->sc_dp[cpu].dp_ci_pa, sc->sc_dp[cpu].dp_ci_size);
+#endif
 
 	sc->sc_dp[cpu].dp_regs_mapped = 1;
 
 out:
 	sched_unpin();
 }
+
+#ifdef __aarch64__
+/*
+ * Map portal CE/CI registers for a specific CPU.
+ * Unlike dpaa_portal_map_registers() which uses PCPU_GET(cpuid),
+ * this takes an explicit CPU parameter so it can be called from
+ * any CPU context during early boot (before smp_started=1).
+ * pmap_mapdev_attr/pmap_mapdev create global kernel VA mappings.
+ */
+void
+dpaa_portal_map_registers_cpu(struct dpaa_portals_softc *sc, int cpu)
+{
+
+	if (sc->sc_dp[cpu].dp_regs_mapped)
+		return;
+	if (sc->sc_dp[cpu].dp_ce_pa == 0) {
+		printf("dpaa_portal_map_registers_cpu: "
+		    "cpu %d has no portal allocated\n", cpu);
+		return;
+	}
+	sc->sc_dp[cpu].dp_ce_va = (vm_offset_t)pmap_mapdev_attr(
+	    sc->sc_dp[cpu].dp_ce_pa, sc->sc_dp[cpu].dp_ce_size,
+	    VM_MEMATTR_UNCACHEABLE);
+	sc->sc_dp[cpu].dp_ci_va = (vm_offset_t)pmap_mapdev(
+	    sc->sc_dp[cpu].dp_ci_pa, sc->sc_dp[cpu].dp_ci_size);
+	sc->sc_dp[cpu].dp_regs_mapped = 1;
+}
+#endif

@@ -27,7 +27,10 @@
 #ifndef FMAN_H_
 #define FMAN_H_
 
+#include <sys/rman.h>
 #include <dev/fdt/simplebus.h>
+
+struct fmcd_softc;	/* Forward declaration */
 
 /**
  * FMan driver instance data.
@@ -46,6 +49,16 @@ struct fman_softc {
 
 	t_Handle fm_handle;
 	t_Handle muram_handle;
+	t_Handle pcd_handle;
+	t_Handle netenv_handle;
+
+	/* Host Command port state (for advanced offload) */
+	t_Handle hc_tx_fqr;	/* TX FQR for HC enqueue */
+	t_Handle hc_err_fqr;	/* Error FQR for HC port */
+	t_Handle hc_conf_fqr;	/* Confirmation FQR for HC port */
+
+	/* FMD chardev interface (for userspace PCD control via fmlib/FMC) */
+	struct fmcd_softc *fmcd;
 };
 
 
@@ -73,5 +86,9 @@ uint32_t	fman_get_clock(struct fman_softc *sc);
 int	fman_get_handle(device_t dev, t_Handle *fmh);
 int	fman_get_muram_handle(device_t dev, t_Handle *muramh);
 int	fman_get_bushandle(device_t dev, vm_offset_t *fm_base);
+int	fman_get_pcd_handle(device_t dev, t_Handle *pcdh);
+int	fman_get_netenv_handle(device_t dev, t_Handle *netenvh);
+int	fman_reinit_pcd_with_hc(device_t dev);
+struct fmcd_softc *fman_get_fmcd(device_t dev);
 
 #endif /* FMAN_H_ */

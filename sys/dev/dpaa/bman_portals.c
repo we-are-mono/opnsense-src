@@ -38,12 +38,15 @@
 #include <sys/sched.h>
 
 #include <machine/bus.h>
+#include <machine/resource.h>
+#include <sys/rman.h>
+#ifdef __powerpc__
 #include <machine/tlb.h>
+#include <powerpc/mpc85xx/mpc85xx.h>
+#endif
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
-
-#include <powerpc/mpc85xx/mpc85xx.h>
 
 #include "bman.h"
 #include "portals.h"
@@ -55,15 +58,16 @@ struct dpaa_portals_softc *bp_sc;
 int
 bman_portals_attach(device_t dev)
 {
-	struct dpaa_portals_softc *sc;
+	bp_sc = device_get_softc(dev);
 
-	sc = bp_sc = device_get_softc(dev);
-	
-	/* Map bman portal to physical address space */
+#ifdef __powerpc__
+	struct dpaa_portals_softc *sc = bp_sc;
+	/* Map bman portal to physical address space (PowerPC LAW) */
 	if (law_enable(OCP85XX_TGTIF_BMAN, sc->sc_dp_pa, sc->sc_dp_size)) {
 		bman_portals_detach(dev);
 		return (ENXIO);
 	}
+#endif
 	/* Set portal properties for XX_VirtToPhys() */
 	XX_PortalSetInfo(dev);
 
@@ -146,8 +150,8 @@ bman_portal_setup(struct bman_softc *bsc)
 	dpaa_portal_map_registers(sc);
 
 	/* Configure and initialize portal */
-	bpp.ceBaseAddress = rman_get_bushandle(sc->sc_rres[0]);
-	bpp.ciBaseAddress = rman_get_bushandle(sc->sc_rres[1]);
+	bpp.ceBaseAddress = sc->sc_dp[cpu].dp_ce_va;
+	bpp.ciBaseAddress = sc->sc_dp[cpu].dp_ci_va;
 	bpp.h_Bm = bsc->sc_bh;
 	bpp.swPortalId = cpu;
 	bpp.irq = (uintptr_t)sc->sc_dp[cpu].dp_ires;
@@ -174,3 +178,54 @@ err:
 
 	return (NULL);
 }
+
+#ifdef __aarch64__
+/*
+ * Initialize a BMan portal for a specific CPU from any CPU context.
+ * Unlike bman_portal_setup() which uses PCPU_GET(cpuid), this takes
+ * an explicit CPU parameter.  On ARM64, pmap_mapdev creates global
+ * kernel VA, so no sched_bind/migration is needed.
+ *
+ * BMan has no SDEST configuration (confirmed from Linux reference).
+ */
+t_Handle
+bman_portal_init_cpu(struct bman_softc *bsc, int cpu)
+{
+	struct dpaa_portals_softc *sc;
+	t_BmPortalParam bpp;
+	t_Handle portal;
+
+	if (bp_sc == NULL)
+		return (NULL);
+	sc = bp_sc;
+
+	/* Skip if already initialized */
+	if (sc->sc_dp[cpu].dp_ph != NULL)
+		return (sc->sc_dp[cpu].dp_ph);
+
+	/* Map CE/CI registers (global kernel VA, accessible from any CPU) */
+	dpaa_portal_map_registers_cpu(sc, cpu);
+
+	if (sc->sc_dp[cpu].dp_ce_va == 0 || sc->sc_dp[cpu].dp_ci_va == 0)
+		return (NULL);
+
+	memset(&bpp, 0, sizeof(bpp));
+	bpp.ceBaseAddress = sc->sc_dp[cpu].dp_ce_va;
+	bpp.ciBaseAddress = sc->sc_dp[cpu].dp_ci_va;
+	bpp.h_Bm = bsc->sc_bh;
+	bpp.swPortalId = cpu;
+	bpp.irq = (uintptr_t)sc->sc_dp[cpu].dp_ires;
+
+	portal = BM_PORTAL_Config(&bpp);
+	if (portal == NULL)
+		return (NULL);
+
+	if (BM_PORTAL_Init(portal) != E_OK) {
+		BM_PORTAL_Free(portal);
+		return (NULL);
+	}
+
+	sc->sc_dp[cpu].dp_ph = portal;
+	return (portal);
+}
+#endif

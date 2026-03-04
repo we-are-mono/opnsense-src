@@ -39,7 +39,7 @@
 /**
  * Maximum number of frame queues in all QMans.
  */
-#define		QMAN_MAX_FQIDS			16
+#define		QMAN_MAX_FQIDS			4096
 
 /**
  * Pool channel common to all software portals.
@@ -85,6 +85,8 @@ struct qman_softc {
  * @group QMan bus interface
  * @{
  */
+extern struct qman_softc *qman_sc;
+
 int qman_attach(device_t dev);
 int qman_detach(device_t dev);
 int qman_suspend(device_t dev);
@@ -186,6 +188,16 @@ t_Error	qman_fqr_register_cb(t_Handle fqr, t_QmReceivedFrameCallback *callback,
 t_Error qman_fqr_enqueue(t_Handle fqr, uint32_t fqid_off, t_DpaaFD *frame);
 
 /**
+ * Enqueue a frame to a specific FQID (bypassing FQR).
+ * Used for CEETM frame queues managed by CEETM hardware.
+ *
+ * @param fqid		Target Frame Queue ID.
+ * @param frame		A frame to be enqueued.
+ * @return		E_OK on success; error code otherwise.
+ */
+t_Error qman_enqueue_fqid(uint32_t fqid, t_DpaaFD *frame);
+
+/**
  * Get one of the FQR counter's value.
  *
  * @param fqr		A handle to FQR.
@@ -238,6 +250,39 @@ e_RxStoreResponse qman_received_frame_callback(t_Handle app, t_Handle qm_fqr,
 e_RxStoreResponse qman_rejected_frame_callback(t_Handle app, t_Handle qm_fqr,
     t_Handle qm_portal, uint32_t fqid_offset, t_DpaaFD *frame,
     t_QmRejectedFrameInfo *qm_rejected_frame_info);
+
+/**
+ * Create Frame Queue Range with explicit contextA/B.
+ *
+ * Same as qman_fqr_create() but allows setting raw FQD contextA and
+ * contextB fields.  Used by CDX to create forwarding TX FQs with
+ * OVFQ/EBD bits set for hardware flow offload.
+ *
+ * @param fqids_num		Number of frame queues in the range.
+ * @param channel		Dedicated channel (e.g. FMan TX port).
+ * @param wq			Work Queue Number within the channel.
+ * @param force_fqid		If TRUE, force allocation of specific FQID.
+ * @param fqid_or_align		FQID if force_fqid, alignment otherwise.
+ * @param prefer_in_cache	If TRUE, prefer QMan internal cache.
+ * @param p_context_a		Raw contextA (8 bytes), or NULL.
+ * @param p_context_b		Raw contextB (4 bytes), or NULL.
+ * @return			NCSW FQR handle, or NULL on failure.
+ */
+t_Handle qman_fqr_create_ctx(uint32_t fqids_num, e_QmFQChannel channel,
+    uint8_t wq, bool force_fqid, uint32_t fqid_or_align,
+    bool prefer_in_cache, t_QmContextA *p_context_a,
+    t_QmContextB *p_context_b);
+
+uint32_t qman_get_pfdr_in_use(void);
+uint32_t qman_get_sfdr_in_use(void);
+
+#ifdef __aarch64__
+t_Handle qman_portal_init_cpu(struct qman_softc *, int);
+void qman_portal_dqrr_diag(void);
+void qman_ccsr_diag(void);
+struct mbuf;
+void qman_rx_defer(struct mbuf *);
+#endif
 
 /** @} */
 

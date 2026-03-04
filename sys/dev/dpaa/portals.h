@@ -35,6 +35,8 @@ typedef struct dpaa_portal {
 	vm_paddr_t	dp_ci_pa;		/* portal's CI area PA */
 	uint32_t	dp_ce_size;		/* portal's CE area size */
 	uint32_t	dp_ci_size;		/* portal's CI area size */
+	vm_offset_t	dp_ce_va;		/* per-CPU CE virtual addr */
+	vm_offset_t	dp_ci_va;		/* per-CPU CI virtual addr */
 	uintptr_t	dp_intr_num;		/* portal's intr. number */
 } dpaa_portal_t;
 
@@ -60,3 +62,6 @@ int qman_portals_detach(device_t);
 
 int dpaa_portal_alloc_res(device_t, struct dpaa_portals_devinfo *, int);
 void dpaa_portal_map_registers(struct dpaa_portals_softc *);
+#ifdef __aarch64__
+void dpaa_portal_map_registers_cpu(struct dpaa_portals_softc *, int);
+#endif
