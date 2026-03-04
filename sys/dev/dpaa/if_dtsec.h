@@ -165,6 +165,16 @@ e_FmPortType	dtsec_fm_port_tx_type(enum eth_dev_type type);
 
 
 /**
+ * @group dTSEC external buffer release.
+ *
+ * Used by dpaa_wifi.ko to free BMan buffers from dtsec RX pools
+ * back to the correct UMA zone with proper consumption model accounting.
+ * @{
+ */
+void		dtsec_rm_buf_free_external(uint8_t bpid, void *buf);
+/** @} */
+
+/**
  * @group dTSEC bus interface.
  * @{
  */
