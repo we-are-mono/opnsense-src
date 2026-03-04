@@ -36,12 +36,25 @@
 #include <sys/pcpu.h>
 #include <sys/rman.h>
 #include <sys/sched.h>
+#include <sys/smp.h>
+#include <sys/malloc.h>
 
+#include <machine/resource.h>
+#ifdef __powerpc__
 #include <machine/tlb.h>
+#endif
+
+#ifdef __aarch64__
+#include <dev/ofw/ofw_bus.h>
+#include <dev/ofw/ofw_bus_subr.h>
+#endif
 
 #include "bman.h"
 
+#define FBPR_ENTRY_SIZE	64	/* matches NCSW bm.h */
+
 static struct bman_softc *bman_sc;
+static t_Handle bman_pool_by_bpid[BM_MAX_NUM_OF_POOLS];
 
 extern t_Handle bman_portal_setup(struct bman_softc *bsc);
 
@@ -73,6 +86,7 @@ bman_exception(t_Handle h_App, e_BmExceptions exception)
 
 	device_printf(sc->sc_dev, "BMAN Exception: %s.\n", message);
 }
+
 
 int
 bman_attach(device_t dev)
@@ -114,12 +128,47 @@ bman_attach(device_t dev)
 	bp.partBpidBase = 0;
 	bp.partNumOfPools = BM_MAX_NUM_OF_POOLS;
 
+#ifdef __aarch64__
+	/*
+	 * Parse DT memory-region phandle for FBPR, matching Linux.
+	 * DT: memory-region = <&bman_fbpr>;
+	 *   bman-fbpr: size=0x1000000 (16MB)
+	 */
+	{
+		extern void *qbman_alloc_reserved_mem(device_t, phandle_t,
+		    uint32_t *, const char *);
+		phandle_t node, mem_node;
+		pcell_t mem_handle;
+
+		node = ofw_bus_get_node(dev);
+		if (node > 0 && OF_getencprop(node, "memory-region",
+		    (void *)&mem_handle, sizeof(mem_handle)) ==
+		    sizeof(mem_handle)) {
+			mem_node = OF_node_from_xref(mem_handle);
+			if (mem_node > 0) {
+				bp.p_FbprBase =
+				    qbman_alloc_reserved_mem(dev,
+				    mem_node, &bp.fbprSize, "FBPR");
+				if (bp.p_FbprBase != NULL)
+					bp.totalNumOfBuffers =
+					    bp.fbprSize / FBPR_ENTRY_SIZE * 8;
+			}
+		} else {
+			device_printf(dev,
+			    "no memory-region property, using defaults\n");
+		}
+	}
+#endif
+
+	device_printf(dev, "CCSR va=%#lx totalBufs=%u\n",
+	    (unsigned long)bp.baseAddress, bp.totalNumOfBuffers);
+
 	sc->sc_bh = BM_Config(&bp);
 	if (sc->sc_bh == NULL)
 		goto err;
 
-	/* Warn if there is less than 5% free FPBR's in pool */
-	error = BM_ConfigFbprThreshold(sc->sc_bh, (BMAN_MAX_BUFFERS / 8) / 20);
+	/* Warn if there is less than 5% free FBPR's in pool */
+	error = BM_ConfigFbprThreshold(sc->sc_bh, (bp.totalNumOfBuffers / 8) / 20);
 	if (error != E_OK)
 		goto err;
 
@@ -133,6 +182,18 @@ bman_attach(device_t dev)
 
 	device_printf(dev, "Hardware version: %d.%d.\n",
 	    rev.majorRev, rev.minorRev);
+
+#ifdef __aarch64__
+	/*
+	 * Initialize BMan portals for all CPUs from boot CPU.
+	 * ARM64: pmap_mapdev creates global kernel VA, no sched_bind needed.
+	 */
+	for (int cpu = 0; cpu < mp_ncpus; cpu++) {
+		if (bman_portal_init_cpu(sc, cpu) == NULL)
+			device_printf(dev,
+			    "could not setup BMan portal on CPU %d\n", cpu);
+	}
+#endif
 
 	return (0);
 
@@ -255,6 +316,7 @@ bman_pool_create(uint8_t *bpid, uint16_t bufferSize, uint16_t maxBuffers,
 
 	*bpid = BM_POOL_GetId(pool);
 	sc->sc_bpool_cpu[*bpid] = PCPU_GET(cpuid);
+	bman_pool_by_bpid[*bpid] = pool;
 
 	sched_unpin();
 
@@ -275,6 +337,7 @@ bman_pool_destroy(t_Handle pool)
 	struct bman_softc *sc;
 
 	sc = bman_sc;
+	bman_pool_by_bpid[BM_POOL_GetId(pool)] = NULL;
 	thread_lock(curthread);
 	sched_bind(curthread, sc->sc_bpool_cpu[BM_POOL_GetId(pool)]);
 	thread_unlock(curthread);
@@ -362,4 +425,13 @@ bman_count(t_Handle pool)
 {
 
 	return (BM_POOL_GetCounter(pool, e_BM_POOL_COUNTERS_CONTENT));
+}
+
+t_Handle
+bman_pool_for_bpid(uint8_t bpid)
+{
+
+	if (bpid >= BM_MAX_NUM_OF_POOLS)
+		return (NULL);
+	return (bman_pool_by_bpid[bpid]);
 }

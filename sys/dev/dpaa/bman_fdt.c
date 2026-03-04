@@ -34,6 +34,8 @@
 #include <sys/smp.h>
 
 #include <machine/bus.h>
+#include <machine/resource.h>
+#include <sys/rman.h>
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
@@ -103,7 +105,10 @@ static driver_t bm_portals_driver = {
 };
 
 EARLY_DRIVER_MODULE(bman_portals, ofwbus, bm_portals_driver, 0, 0,
-    BUS_PASS_BUS);
+    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_LAST);
+/* On ARM64, portal bus nodes are children of soc (simplebus), not ofwbus */
+EARLY_DRIVER_MODULE(bman_portals, simplebus, bm_portals_driver, 0, 0,
+    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_LAST);
 
 static void
 get_addr_props(phandle_t node, uint32_t *addrp, uint32_t *sizep)
@@ -147,7 +152,7 @@ bman_portal_find_cpu(int cpu)
 		return (node);
 
 	for (node = OF_child(node); node != 0; node = OF_peer(node)) {
-		if (OF_getprop(node, "reg", &reg, sizeof(reg)) <= 0)
+		if (OF_getencprop(node, "reg", &reg, sizeof(reg)) <= 0)
 			continue;
 		if (reg == cpu)
 			return (node);
@@ -184,14 +189,16 @@ bman_portals_fdt_attach(device_t dev)
 			continue;
 		}
 		/* Checkout related cpu */
-		if (OF_getprop(child, "cpu-handle", (void *)&cpu,
+		if (OF_getencprop(child, "cpu-handle", (void *)&cpu,
 		    sizeof(cpu)) <= 0) {
-			cpu = bman_portal_find_cpu(cpus);
-			if (cpu <= 0)
+			/* No cpu-handle (ARM64): find CPU node directly */
+			cpu_node = bman_portal_find_cpu(cpus);
+			if (cpu_node <= 0)
 				continue;
+		} else {
+			/* cpu-handle is an ihandle (PowerPC) */
+			cpu_node = OF_instance_to_package(cpu);
 		}
-		/* Acquire cpu number */
-		cpu_node = OF_instance_to_package(cpu);
 		if (OF_getencprop(cpu_node, "reg", &cpu_num, sizeof(cpu_num)) <= 0) {
 			device_printf(dev, "Could not retrieve CPU number.\n");
 			return (ENXIO);

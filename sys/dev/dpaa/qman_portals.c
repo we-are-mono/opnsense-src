@@ -36,14 +36,18 @@
 #include <sys/proc.h>
 #include <sys/pcpu.h>
 #include <sys/sched.h>
+#include <sys/smp.h>
 
 #include <machine/bus.h>
+#include <machine/resource.h>
+#include <sys/rman.h>
+#ifdef __powerpc__
 #include <machine/tlb.h>
+#include <powerpc/mpc85xx/mpc85xx.h>
+#endif
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
-
-#include <powerpc/mpc85xx/mpc85xx.h>
 
 #include "qman.h"
 #include "portals.h"
@@ -60,15 +64,16 @@ struct dpaa_portals_softc *qp_sc;
 int
 qman_portals_attach(device_t dev)
 {
-	struct dpaa_portals_softc *sc;
+	qp_sc = device_get_softc(dev);
 
-	sc = qp_sc = device_get_softc(dev);
-	
-	/* Map bman portal to physical address space */
+#ifdef __powerpc__
+	struct dpaa_portals_softc *sc = qp_sc;
+	/* Map qman portal to physical address space (PowerPC LAW) */
 	if (law_enable(OCP85XX_TGTIF_QMAN, sc->sc_dp_pa, sc->sc_dp_size)) {
 		qman_portals_detach(dev);
 		return (ENXIO);
 	}
+#endif
 	/* Set portal properties for XX_VirtToPhys() */
 	XX_PortalSetInfo(dev);
 
@@ -128,6 +133,19 @@ qman_portal_setup(struct qman_softc *qsc)
 
 	sc = qp_sc;
 
+#ifdef __aarch64__
+	/*
+	 * On ARM64, all portals are pre-initialized with NAPI-style
+	 * interrupt handling via qman_portal_init_cpu() in qman_attach().
+	 * Just return the portal for the current CPU.
+	 */
+	sched_pin();
+	cpu = PCPU_GET(cpuid);
+	portal = sc->sc_dp[cpu].dp_ph;
+	sched_unpin();
+	return (portal);
+#endif
+
 	sched_pin();
 	portal = NULL;
 	cpu = PCPU_GET(cpuid);
@@ -150,9 +168,14 @@ qman_portal_setup(struct qman_softc *qsc)
 	/* Map portal registers */
 	dpaa_portal_map_registers(sc);
 
+
+	/* Bail if portal mapping failed (e.g. no portal allocated for this CPU) */
+	if (sc->sc_dp[cpu].dp_ce_va == 0 || sc->sc_dp[cpu].dp_ci_va == 0)
+		goto err;
+
 	/* Configure and initialize portal */
-	qpp.ceBaseAddress = rman_get_bushandle(sc->sc_rres[0]);
-	qpp.ciBaseAddress = rman_get_bushandle(sc->sc_rres[1]);
+	qpp.ceBaseAddress = sc->sc_dp[cpu].dp_ce_va;
+	qpp.ciBaseAddress = sc->sc_dp[cpu].dp_ci_va;
 	qpp.h_Qm = qsc->sc_qh;
 	qpp.swPortalId = cpu;
 	qpp.irq = (uintptr_t)sc->sc_dp[cpu].dp_ires;
@@ -186,3 +209,220 @@ err:
 
 	return (NULL);
 }
+
+#ifdef __aarch64__
+
+#include <sys/taskqueue.h>
+#include <sys/epoch.h>
+#include <sys/mbuf.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <net/if_var.h>
+
+/* Per-portal NAPI state */
+static struct {
+	struct task	task;
+	struct taskqueue *tq;
+	struct mbufq	rxq;		/* deferred RX mbufs */
+} qman_napi[MAXCPU];
+
+/* Declared in xx_arm64.c */
+extern void XX_ConfigPortalNapi(uintptr_t irq, struct taskqueue *tq,
+    struct task *task);
+extern void XX_SetPortalNapiHandle(uintptr_t irq, t_Handle portal);
+
+/*
+ * Enqueue an mbuf for deferred delivery after QM_PORTAL_Poll returns.
+ * Called from the DQRR RX callback (inside NCSW_PLOCK) to avoid
+ * re-entering the portal via if_input -> TCP -> TX -> QM_FQR_Enqueue.
+ */
+void
+qman_rx_defer(struct mbuf *m)
+{
+	int cpu = PCPU_GET(cpuid);
+
+	if (mbufq_enqueue(&qman_napi[cpu].rxq, m) != 0) {
+		static volatile uint32_t defer_drop_cnt;
+		uint32_t n = atomic_fetchadd_32(&defer_drop_cnt, 1) + 1;
+		if (n <= 5)
+			printf("qman: rx_defer queue full on CPU %d (#%u),"
+			    " dropping\n", cpu, n);
+		m_freem(m);
+	}
+}
+
+/*
+ * NAPI-style poll task for QMan portals (FreeBSD equivalent of Linux
+ * dpaa_eth_poll).  Runs in a per-CPU taskqueue thread at PI_NET,
+ * scheduled by the FILTER interrupt handler via XX_PortalFilter.
+ *
+ * Drains the entire DQRR (max 16 entries) and MR in one shot via
+ * QM_PORTAL_Poll, then delivers deferred RX mbufs outside NCSW_PLOCK
+ * to prevent nested portal enqueue from the TX path.
+ */
+static void
+qman_portal_poll_task(void *arg, int pending)
+{
+	t_Handle portal = arg;
+	struct mbuf *m;
+	int cpu = PCPU_GET(cpuid);
+
+	QM_PORTAL_Poll(portal, e_QM_PORTAL_POLL_SOURCE_BOTH);
+	QM_PORTAL_Uninhibit(portal);
+
+	/* Deliver deferred RX mbufs outside NCSW_PLOCK */
+	while ((m = mbufq_dequeue(&qman_napi[cpu].rxq)) != NULL)
+		if_input(m->m_pkthdr.rcvif, m);
+}
+
+/*
+ * Initialize a QMan portal for a specific CPU with NAPI-style
+ * interrupt handling.  Like Linux's qman_create_affine_portal +
+ * dpaa_eth_add_channel:
+ *
+ *   1. Create a per-CPU taskqueue pinned to the portal's CPU
+ *   2. Configure the portal interrupt for FILTER mode (via
+ *      XX_ConfigPortalNapi) — the FILTER handler inhibits the
+ *      portal and enqueues the taskqueue task
+ *   3. Initialize the NCSW portal (Config + Stash + Init)
+ *   4. Subscribe to the pool channel so QMan distributes RX
+ *      frames across all portals (round-robin)
+ *
+ * On ARM64, pmap_mapdev creates global kernel VA, so no
+ * sched_bind/migration is needed.
+ */
+t_Handle
+qman_portal_init_cpu(struct qman_softc *qsc, int cpu)
+{
+	struct dpaa_portals_softc *sc;
+	t_QmPortalParam qpp;
+	t_QmPortalStashParam stash;
+	t_Handle portal;
+	cpuset_t cpumask;
+
+	if (qp_sc == NULL)
+		return (NULL);
+	sc = qp_sc;
+
+	/* Skip if already initialized */
+	if (sc->sc_dp[cpu].dp_ph != NULL)
+		return (sc->sc_dp[cpu].dp_ph);
+
+	/* Map CE/CI registers (global kernel VA, accessible from any CPU) */
+	dpaa_portal_map_registers_cpu(sc, cpu);
+
+	if (sc->sc_dp[cpu].dp_ce_va == 0 || sc->sc_dp[cpu].dp_ci_va == 0)
+		return (NULL);
+
+	if (sc->sc_dp[cpu].dp_ires == NULL) {
+		printf("qman: portal %d has no IRQ resource\n", cpu);
+		return (NULL);
+	}
+
+	/* Init deferred RX mbuf queue (unlimited — DQRR ring is the natural cap) */
+	mbufq_init(&qman_napi[cpu].rxq, 0);
+
+	/*
+	 * Create per-CPU taskqueue for NAPI-style polling.
+	 * The task arg is set to the portal handle after Init.
+	 */
+	CPU_ZERO(&cpumask);
+	CPU_SET(cpu, &cpumask);
+	NET_TASK_INIT(&qman_napi[cpu].task, 0, qman_portal_poll_task, NULL);
+	qman_napi[cpu].tq = taskqueue_create_fast("qman_poll", M_WAITOK,
+	    taskqueue_thread_enqueue, &qman_napi[cpu].tq);
+	taskqueue_start_threads_cpuset(&qman_napi[cpu].tq, 1, PI_NET,
+	    &cpumask, "qman%d", cpu);
+
+	/*
+	 * Configure NAPI mode before QM_PORTAL_Init — Init calls
+	 * XX_SetIntr internally, which checks for NAPI mode and
+	 * registers a FILTER handler instead of an ithread handler.
+	 */
+	XX_ConfigPortalNapi((uintptr_t)sc->sc_dp[cpu].dp_ires,
+	    qman_napi[cpu].tq, &qman_napi[cpu].task);
+
+	/* Configure portal */
+	memset(&qpp, 0, sizeof(qpp));
+	qpp.ceBaseAddress = sc->sc_dp[cpu].dp_ce_va;
+	qpp.ciBaseAddress = sc->sc_dp[cpu].dp_ci_va;
+	qpp.h_Qm = qsc->sc_qh;
+	qpp.swPortalId = cpu;
+	qpp.irq = (uintptr_t)sc->sc_dp[cpu].dp_ires;
+	qpp.fdLiodnOffset = 0;
+	qpp.f_DfltFrame = qman_received_frame_callback;
+	qpp.f_RejectedFrame = qman_rejected_frame_callback;
+	qpp.h_App = qsc;
+
+	portal = QM_PORTAL_Config(&qpp);
+	if (portal == NULL)
+		return (NULL);
+
+	/*
+	 * Configure stash destination (SDEST) for this CPU.
+	 * Linux: qman_set_sdest(channel, cpu_idx / 2) for QMan v3+.
+	 * Each pair of cores shares one Stash Request Queue (SRQ) in
+	 * the CoreNet fabric.  LS1046A: SRQ0=CPU0-1, SRQ1=CPU2-3.
+	 */
+	memset(&stash, 0, sizeof(stash));
+	stash.stashDestQueue = cpu / 2;
+	QM_PORTAL_ConfigStash(portal, &stash);
+
+	if (QM_PORTAL_Init(portal) != E_OK) {
+		QM_PORTAL_Free(portal);
+		return (NULL);
+	}
+
+	/*
+	 * Set portal handle for the FILTER handler and task.
+	 * The FILTER handler uses this to call QM_PORTAL_Inhibit.
+	 * The task function receives it as the arg parameter.
+	 */
+	XX_SetPortalNapiHandle((uintptr_t)sc->sc_dp[cpu].dp_ires, portal);
+	qman_napi[cpu].task.ta_context = portal;
+
+	/*
+	 * Subscribe to pool channel — all portals get RX frames.
+	 * QMan hardware distributes frames round-robin across all
+	 * portals subscribed to the pool channel, matching Linux's
+	 * dpaa_eth_add_channel() which calls qman_p_static_dequeue_add
+	 * for every CPU's portal.
+	 *
+	 * RX FQs are on per-CPU dedicated channels (RSS), so pool
+	 * channel round-robin no longer causes TCP reordering.  Pool
+	 * channel is still needed for TX confirm, CDX dist FQs, and
+	 * CAAM QI response FQs.
+	 */
+	QM_PORTAL_AddPoolChannel(portal, QMAN_COMMON_POOL_CHANNEL);
+
+	sc->sc_dp[cpu].dp_ph = portal;
+	return (portal);
+}
+
+void
+qman_portal_dqrr_diag(void)
+{
+	struct dpaa_portals_softc *sc;
+	t_Handle portal;
+	uint8_t sw_pi, sw_ci, sw_fill, hw_pi, hw_ci;
+	uint32_t isr, ier, iir;
+	int cpu;
+
+	if (qp_sc == NULL)
+		return;
+	sc = qp_sc;
+
+	for (cpu = 0; cpu < mp_ncpus; cpu++) {
+		portal = sc->sc_dp[cpu].dp_ph;
+		if (portal == NULL)
+			continue;
+		QM_PORTAL_DqrrDiag(portal, &sw_pi, &sw_ci, &sw_fill,
+		    &hw_pi, &hw_ci);
+		QM_PORTAL_IsrDiag(portal, &isr, &ier, &iir);
+		printf("qman: portal%d: dqrr sw_pi=%u sw_ci=%u fill=%u "
+		    "hw_pi=%u hw_ci=%u isr=0x%05x ier=0x%05x iir=%u\n",
+		    cpu, sw_pi, sw_ci, sw_fill, hw_pi, hw_ci,
+		    isr, ier, iir);
+	}
+}
+#endif

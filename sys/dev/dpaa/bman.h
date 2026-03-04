@@ -35,8 +35,8 @@
  * BMAN Configuration
  */
 
-/* Maximum number of buffers in all BMAN pools */
-#define BMAN_MAX_BUFFERS	4096
+/* Maximum number of buffers in all BMAN pools (FBPR ring entries) */
+#define BMAN_MAX_BUFFERS	65536
 
 /*
  * Portal definitions
@@ -189,6 +189,7 @@ int bman_put_buffer(t_Handle pool, void *buffer);
  * @returns		Number of free buffers in pool.
  */
 uint32_t bman_count(t_Handle pool);
+t_Handle bman_pool_for_bpid(uint8_t bpid);
 
 /*
  * Bus i/f
@@ -198,5 +199,9 @@ int bman_detach(device_t dev);
 int bman_suspend(device_t dev);
 int bman_resume(device_t dev);
 int bman_shutdown(device_t dev);
+
+#ifdef __aarch64__
+t_Handle bman_portal_init_cpu(struct bman_softc *, int);
+#endif
 
 #endif /* BMAN_H */

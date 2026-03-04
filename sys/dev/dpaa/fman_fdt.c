@@ -31,6 +31,7 @@
 #include <sys/bus.h>
 #include <sys/module.h>
 
+#include <dev/extres/clk/clk.h>
 #include <dev/fdt/simplebus.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
@@ -62,8 +63,11 @@ static device_method_t fman_methods[] = {
 
 DEFINE_CLASS_1(fman, fman_driver, fman_methods,
     sizeof(struct fman_softc), simplebus_driver);
+/* Probe after GIC (BUS_PASS_INTERRUPT + BUS_PASS_ORDER_MIDDLE = 45)
+ * so interrupt allocation works on the first attempt.
+ * Also after clockgen (BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE) for clk_get_freq(). */
 EARLY_DRIVER_MODULE(fman, simplebus, fman_driver, 0, 0,
-    BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE);
+    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_LAST);
 
 
 static int
@@ -87,18 +91,29 @@ fman_get_clock(struct fman_softc *sc)
 	device_t dev;
 	phandle_t node;
 	pcell_t fman_clock;
+	clk_t clk;
+	uint64_t freq;
 
 	dev = sc->sc_base.dev;
 	node = ofw_bus_get_node(dev);
 
+	/* Try static clock-frequency property first (PowerPC style) */
 	if ((OF_getprop(node, "clock-frequency", &fman_clock,
-	    sizeof(fman_clock)) <= 0) || (fman_clock == 0)) {
-		device_printf(dev, "could not acquire correct frequency "
-		    "from DTS\n");
+	    sizeof(fman_clock)) > 0) && (fman_clock != 0))
+		return ((uint32_t)fman_clock);
 
-		return (0);
+	/* Fall back to clock framework (ARM64 style) */
+	if (clk_get_by_ofw_index(dev, node, 0, &clk) == 0) {
+		if (clk_enable(clk) == 0 &&
+		    clk_get_freq(clk, &freq) == 0 && freq != 0) {
+			device_printf(dev, "FMan clock: %ju Hz\n",
+			    (uintmax_t)freq);
+			return ((uint32_t)freq);
+		}
+		clk_release(clk);
 	}
 
-	return ((uint32_t)fman_clock);
+	device_printf(dev, "could not acquire correct frequency from DTS\n");
+	return (0);
 }
 
