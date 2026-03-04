@@ -303,6 +303,10 @@ int	bridge_rtable_prune_period = BRIDGE_RTABLE_PRUNE_PERIOD;
 VNET_DEFINE_STATIC(uma_zone_t, bridge_rtnode_zone);
 #define	V_bridge_rtnode_zone	VNET(bridge_rtnode_zone)
 
+/* L2 flow offload hooks (set by auto_bridge.ko) */
+bridge_l2flow_hook_t bridge_l2flow_hook;
+bridge_fdb_can_expire_hook_t bridge_fdb_can_expire_hook;
+
 static int	bridge_clone_create(struct if_clone *, char *, size_t,
 		    struct ifc_data *, struct ifnet **);
 static int	bridge_clone_destroy(struct if_clone *, struct ifnet *, uint32_t);
@@ -2528,6 +2532,9 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
 			return;
 	}
 
+	if (bridge_l2flow_hook != NULL)
+		bridge_l2flow_hook(ifp, m, src_if, dst_if);
+
 	bridge_enqueue(sc, dst_if, m);
 	return;
 
@@ -3110,8 +3117,16 @@ bridge_rtage(struct bridge_softc *sc)
 
 	CK_LIST_FOREACH_SAFE(brt, &sc->sc_rtlist, brt_list, nbrt) {
 		if ((brt->brt_flags & IFBAF_TYPEMASK) == IFBAF_DYNAMIC) {
-			if (time_uptime >= brt->brt_expire)
+			if (time_uptime >= brt->brt_expire) {
+				if (bridge_fdb_can_expire_hook != NULL &&
+				    bridge_fdb_can_expire_hook(brt->brt_addr,
+				    sc->sc_ifp) == 0) {
+					brt->brt_expire = time_uptime +
+					    sc->sc_brttimeout;
+					continue;
+				}
 				bridge_rtnode_destroy(sc, brt);
+			}
 		}
 	}
 }
