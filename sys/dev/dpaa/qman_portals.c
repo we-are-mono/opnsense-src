@@ -270,9 +270,19 @@ qman_portal_poll_task(void *arg, int pending)
 	QM_PORTAL_Poll(portal, e_QM_PORTAL_POLL_SOURCE_BOTH);
 	QM_PORTAL_Uninhibit(portal);
 
-	/* Deliver deferred RX mbufs outside NCSW_PLOCK */
-	while ((m = mbufq_dequeue(&qman_napi[cpu].rxq)) != NULL)
-		if_input(m->m_pkthdr.rcvif, m);
+	/*
+	 * Deliver deferred mbufs outside NCSW_PLOCK.
+	 * M_PROTO1-tagged mbufs are WiFi TX (CDX→WiFi from dpaa_wifi) —
+	 * deliver via if_transmit instead of if_input.
+	 */
+	while ((m = mbufq_dequeue(&qman_napi[cpu].rxq)) != NULL) {
+		if (__predict_false(m->m_flags & M_PROTO1)) {
+			m->m_flags &= ~M_PROTO1;
+			if_transmit(m->m_pkthdr.rcvif, m);
+		} else {
+			if_input(m->m_pkthdr.rcvif, m);
+		}
+	}
 }
 
 /*

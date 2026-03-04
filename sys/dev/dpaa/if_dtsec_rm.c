@@ -610,6 +610,15 @@ dtsec_rm_pool_rx_free(struct dtsec_softc *sc)
 		uma_zdestroy(sc->sc_rx_zone);
 }
 
+/*
+ * BPID→dtsec_softc mapping for cross-module buffer release.
+ *
+ * When dpaa_wifi.ko receives a frame from CDX (buffer from a dtsec BMan
+ * pool), it needs to free the buffer back to the correct dtsec's UMA zone
+ * and decrement sc_rx_buf_total.  This table maps BPID to dtsec_softc.
+ */
+static struct dtsec_softc *dtsec_bpid_map[256];
+
 int
 dtsec_rm_pool_rx_init(struct dtsec_softc *sc)
 {
@@ -633,7 +642,26 @@ dtsec_rm_pool_rx_init(struct dtsec_softc *sc)
 
 	sc->sc_rx_buf_total = DTSEC_RM_POOL_RX_MAX_SIZE;
 
+	/* Register BPID→softc mapping for external buffer release */
+	dtsec_bpid_map[sc->sc_rx_bpid] = sc;
+
 	return (0);
+}
+
+void
+dtsec_rm_buf_free_external(uint8_t bpid, void *buf)
+{
+	struct dtsec_softc *sc;
+
+	sc = dtsec_bpid_map[bpid];
+	if (__predict_false(sc == NULL)) {
+		printf("dtsec_rm_buf_free_external: unknown BPID %u\n", bpid);
+		return;
+	}
+
+	uma_zfree(sc->sc_rx_zone,
+	    (void *)(*(uintptr_t *)buf));	/* recover stashed KVA */
+	atomic_subtract_32(&sc->sc_rx_buf_total, 1);
 }
 /** @} */
 
