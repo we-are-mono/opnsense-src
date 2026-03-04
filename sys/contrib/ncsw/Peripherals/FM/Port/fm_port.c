@@ -36,6 +36,9 @@
 
  @Description   FM driver routines implementation.
  *//***************************************************************************/
+#ifdef __FreeBSD__
+#endif
+
 #include "error_ext.h"
 #include "std_ext.h"
 #include "string_ext.h"
@@ -1349,7 +1352,7 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
     }
 
     /* if CC is used directly after BMI */
-    if ((p_PcdParams->pcdSupport == e_FM_PORT_PCD_SUPPORT_CC_ONLY)
+    if (p_PcdParams->pcdSupport == e_FM_PORT_PCD_SUPPORT_CC_ONLY
 #ifdef FM_CAPWAP_SUPPORT
     || (p_PcdParams->pcdSupport == e_FM_PORT_PCD_SUPPORT_CC_AND_KG)
     || (p_PcdParams->pcdSupport == e_FM_PORT_PCD_SUPPORT_CC_AND_KG_AND_PLCR)
@@ -5271,6 +5274,7 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
 
+    /* Diagnostic: dump all BMI NIA registers after SetPCD */
     RELEASE_LOCK(p_FmPort->lock);
 
     return err;
@@ -5668,7 +5672,7 @@ static t_Error FmPortConfigAutoResForDeepSleepSupport1(t_FmPort *p_FmPort)
     return E_OK;
 }
 
-t_FmPortDsarTablesSizes* FM_PORT_GetDsarTablesMaxSizes(t_Handle h_FmPortRx)
+static t_FmPortDsarTablesSizes* FM_PORT_GetDsarTablesMaxSizes(t_Handle h_FmPortRx)
 {
     t_FmPort *p_FmPort = (t_FmPort *)h_FmPortRx;
     return p_FmPort->deepSleepVars.autoResMaxSizes;

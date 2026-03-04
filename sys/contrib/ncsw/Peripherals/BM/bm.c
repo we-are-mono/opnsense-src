@@ -441,7 +441,7 @@ t_Error BmGetRevision(t_Handle h_Bm, t_BmRevisionInfo *p_BmRevisionInfo)
 
 static void FreeInitResources(t_Bm *p_Bm)
 {
-    if (p_Bm->p_FbprBase)
+    if (p_Bm->p_FbprBase && !p_Bm->fbprExternal)
         XX_FreeSmart(p_Bm->p_FbprBase);
     if (p_Bm->h_Session)
         XX_IpcFreeSession(p_Bm->h_Session);
@@ -491,6 +491,8 @@ t_Handle BM_Config(t_BmParam *p_BmParam)
         p_Bm->p_BmDriverParams->fbprMemPartitionId  = p_BmParam->fbprMemPartitionId;
         p_Bm->p_BmDriverParams->fbprThreshold       = DEFAULT_fbprThreshold;
         p_Bm->p_BmDriverParams->liodn               = p_BmParam->liodn;
+        p_Bm->p_BmDriverParams->p_FbprBaseExt       = p_BmParam->p_FbprBase;
+        p_Bm->p_BmDriverParams->fbprSizeExt         = p_BmParam->fbprSize;
 
     }
     /* build the BM partition IPC address */
@@ -534,25 +536,49 @@ t_Error BM_Init(t_Handle h_Bm)
         WRITE_UINT32(p_Bm->p_BmRegs->liodnr, (uint16_t)p_Bm->p_BmDriverParams->liodn);
 
         /* FBPR memory */
-        dsSize = (uint32_t)(p_Bm->p_BmDriverParams->totalNumOfBuffers * (FBPR_ENTRY_SIZE / 8));
-        LOG2(dsSize, exp);
-        if (!POWER_OF_2(dsSize)) (exp++);
-        dsSize = (uint32_t)(1 << exp);
-        if (dsSize < (4*KILOBYTE))
+        if (p_Bm->p_BmDriverParams->p_FbprBaseExt)
         {
-            dsSize = (4*KILOBYTE);
+            /* Use pre-allocated FBPR memory from caller */
+            p_Bm->p_FbprBase = p_Bm->p_BmDriverParams->p_FbprBaseExt;
+            p_Bm->fbprExternal = TRUE;
+            dsSize = p_Bm->p_BmDriverParams->fbprSizeExt;
             LOG2(dsSize, exp);
+            if (!POWER_OF_2(dsSize)) (exp++);
+            dsSize = (uint32_t)(1 << exp);
         }
-        p_Bm->p_FbprBase = XX_MallocSmart(dsSize, (int)p_Bm->p_BmDriverParams->fbprMemPartitionId, dsSize);
-        if (!p_Bm->p_FbprBase)
+        else
         {
-            FreeInitResources(p_Bm);
-            RETURN_ERROR(MAJOR, E_NO_MEMORY, ("FBPR obj!!!"));
+            dsSize = (uint32_t)(p_Bm->p_BmDriverParams->totalNumOfBuffers * (FBPR_ENTRY_SIZE / 8));
+            LOG2(dsSize, exp);
+            if (!POWER_OF_2(dsSize)) (exp++);
+            dsSize = (uint32_t)(1 << exp);
+            if (dsSize < (4*KILOBYTE))
+            {
+                dsSize = (4*KILOBYTE);
+                LOG2(dsSize, exp);
+            }
+            p_Bm->p_FbprBase = XX_MallocSmart(dsSize, (int)p_Bm->p_BmDriverParams->fbprMemPartitionId, dsSize);
+            if (!p_Bm->p_FbprBase)
+            {
+                FreeInitResources(p_Bm);
+                RETURN_ERROR(MAJOR, E_NO_MEMORY, ("FBPR obj!!!"));
+            }
         }
         phyAddr = XX_VirtToPhys(p_Bm->p_FbprBase);
         WRITE_UINT32(p_Bm->p_BmRegs->fbpr_bare, ((uint32_t)(phyAddr >> 32) & 0xffff));
         WRITE_UINT32(p_Bm->p_BmRegs->fbpr_bar, (uint32_t)phyAddr);
         WRITE_UINT32(p_Bm->p_BmRegs->fbpr_ar, (exp - 1));
+
+        /* Readback and verify FBPR BAR programming */
+        {
+            uint32_t rb_bare = GET_UINT32(p_Bm->p_BmRegs->fbpr_bare);
+            uint32_t rb_bar  = GET_UINT32(p_Bm->p_BmRegs->fbpr_bar);
+            uint32_t rb_ar   = GET_UINT32(p_Bm->p_BmRegs->fbpr_ar);
+            XX_Print("BM FBPR: va=%p phys=0x%08x%08x bare=0x%08x bar=0x%08x ar=0x%08x (exp=%d, size=0x%x)\n",
+                p_Bm->p_FbprBase,
+                (uint32_t)(phyAddr >> 32), (uint32_t)phyAddr,
+                rb_bare, rb_bar, rb_ar, exp, dsSize);
+        }
 
         WRITE_UINT32(p_Bm->p_BmRegs->fbpr_fp_lwit, p_Bm->p_BmDriverParams->fbprThreshold);
         WRITE_UINT32(p_Bm->p_BmRegs->err_isr, p_Bm->exceptions);

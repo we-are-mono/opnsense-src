@@ -88,8 +88,11 @@ static bool IsFmanCtrlCodeLoaded(t_Fm *p_Fm)
 
 static t_Error CheckFmParameters(t_Fm *p_Fm)
 {
+#ifndef __aarch64__
+    /* On ARM64, U-Boot preloads FMan microcode into IRAM; reuse it */
     if (IsFmanCtrlCodeLoaded(p_Fm) && !p_Fm->resetOnInit)
         RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("Old FMan CTRL code is loaded; FM must be reset!"));
+#endif
 #if (DPAA_VERSION < 11)
     if (!p_Fm->p_FmDriverParam->dma_axi_dbg_num_of_beats ||
         (p_Fm->p_FmDriverParam->dma_axi_dbg_num_of_beats > DMA_MODE_MAX_AXI_DBG_NUM_OF_BEATS))
@@ -3434,7 +3437,7 @@ t_Handle FM_Config(t_FmParams *p_FmParam)
 
 #ifdef FM_AID_MODE_NO_TNUM_SW005
     if (p_Fm->p_FmStateStruct->revInfo.majorRev >= 6)
-        p_Fm->p_FmDriverParam->dma_aid_mode = e_FM_DMA_AID_OUT_PORT_ID;
+        p_Fm->p_FmDriverParam->dma_aid_mode = E_FMAN_DMA_AID_OUT_PORT_ID;
 #endif /* FM_AID_MODE_NO_TNUM_SW005 */
 #ifndef FM_QMI_NO_DEQ_OPTIONS_SUPPORT
    if (p_Fm->p_FmStateStruct->revInfo.majorRev != 4)
@@ -3568,12 +3571,15 @@ t_Error FM_Init(t_Handle h_Fm)
     if (!p_Fm->resetOnInit) /* Skip operations done in errata workaround */
     {
 #endif /* FM_UCODE_NOT_RESET_ERRATA_BUGZILLA6173 */
-    /* Load FMan-Controller code to IRAM */
+    /* Load FMan-Controller code to IRAM (skip if no firmware provided,
+       e.g. when U-Boot has already loaded microcode) */
+    if (p_Fm->firmware.p_Code)
+    {
+        ClearIRam(p_Fm);
 
-    ClearIRam(p_Fm);
-
-    if (p_Fm->firmware.p_Code && (LoadFmanCtrlCode(p_Fm) != E_OK))
-        RETURN_ERROR(MAJOR, E_INVALID_STATE, NO_MSG);
+        if (LoadFmanCtrlCode(p_Fm) != E_OK)
+            RETURN_ERROR(MAJOR, E_INVALID_STATE, NO_MSG);
+    }
 #ifdef FM_UCODE_NOT_RESET_ERRATA_BUGZILLA6173
     }
 #endif /* FM_UCODE_NOT_RESET_ERRATA_BUGZILLA6173 */
@@ -4825,6 +4831,86 @@ uint32_t FM_GetCounter(t_Handle h_Fm, e_FmCounters counter)
     return fman_get_counter(&fman_rg, fsl_counter);
 }
 
+#ifdef __aarch64__
+void FM_ErrorDiag(t_Handle h_Fm, uint8_t hwPortId)
+{
+    t_Fm *p = (t_Fm *)h_Fm;
+    uint32_t ps, epi, cld, npi, gs, ts, eie, dmsr, ievr;
+    uint32_t dmtah, dmtal;
+
+    /* FPM: port stall status + error pending */
+    ps  = ioread32be(&p->p_FmFpmRegs->fmfp_ps[hwPortId]);
+    epi = ioread32be(&p->p_FmFpmRegs->fm_epi);
+    cld = ioread32be(&p->p_FmFpmRegs->fm_cld);
+    npi = ioread32be(&p->p_FmFpmRegs->fm_npi);
+
+    /* QMI: global status + task status + error */
+    gs  = ioread32be(&p->p_FmQmiRegs->fmqm_gs);
+    ts  = ioread32be(&p->p_FmQmiRegs->fmqm_ts);
+    eie = ioread32be(&p->p_FmQmiRegs->fmqm_eie);
+
+    /* DMA: status + last transfer address */
+    dmsr  = ioread32be(&p->p_FmDmaRegs->fmdmsr);
+    dmtah = ioread32be(&p->p_FmDmaRegs->fmdmtah);
+    dmtal = ioread32be(&p->p_FmDmaRegs->fmdmtal);
+
+    /* BMI: interrupt event */
+    ievr = ioread32be(&p->p_FmBmiRegs->fmbm_ievr);
+
+    printf("fman: FPM port[%u] ps=0x%08x %s\n",
+        hwPortId, ps, (ps & 0x00800000) ? "STALLED" : "ok");
+    printf("fman: FPM epi=0x%08x npi=0x%08x cld=0x%08x\n", epi, npi, cld);
+    printf("fman: QMI gs=0x%08x ts=0x%08x eie=0x%08x\n", gs, ts, eie);
+    printf("fman: DMA sr=0x%08x addr=0x%08x%08x\n", dmsr, dmtah, dmtal);
+    printf("fman: BMI ievr=0x%08x\n", ievr);
+}
+
+void FM_TaskStatusDiag(t_Handle h_Fm, uint8_t hwPortId)
+{
+    t_Fm *p = (t_Fm *)h_Fm;
+    uint32_t pp, ts;
+    int t, port_tasks = 0, total_active = 0;
+    uint8_t port_count[256];
+    int i, dumped = 0;
+
+    if (hwPortId == 0 || hwPortId > 63)
+        return;
+
+    memset(port_count, 0, sizeof(port_count));
+
+    /* Read configured tasks from BMI Port Parameters */
+    pp = ioread32be(&p->p_FmBmiRegs->fmbm_pp[hwPortId - 1]);
+    printf("fman: BMI pp[%u]=0x%08x (tasks=%u, extra=%u)\n",
+        hwPortId, pp,
+        ((pp >> 24) & 0x3f) + 1,
+        (pp >> 16) & 0xf);
+
+    /* Scan FPM task status registers — dump first 8 non-zero raw values */
+    for (t = 0; t < 128; t++) {
+        ts = ioread32be(&p->p_FmFpmRegs->fmfp_ts[t]);
+        if (ts != 0) {
+            uint8_t owner = (ts >> 24) & 0xff;
+            total_active++;
+            port_count[owner]++;
+            if (owner == hwPortId)
+                port_tasks++;
+            if (dumped < 8) {
+                printf("fman: ts[%d]=0x%08x (owner=%u)\n", t, ts, owner);
+                dumped++;
+            }
+        }
+    }
+
+    /* Print per-port task breakdown for all ports with active tasks */
+    printf("fman: task breakdown:");
+    for (i = 0; i < 256; i++) {
+        if (port_count[i] > 0)
+            printf(" port%d=%d", i, port_count[i]);
+    }
+    printf(" (total=%d, port%u=%d)\n", total_active, hwPortId, port_tasks);
+}
+#endif
+
 t_Error FM_ModifyCounter(t_Handle h_Fm, e_FmCounters counter, uint32_t val)
 {
     t_Fm *p_Fm = (t_Fm*)h_Fm;
@@ -5191,7 +5277,7 @@ t_Handle FmGetPcd(t_Handle h_Fm)
 extern void *g_MemacRegs;
 void fm_clk_down(void);
 uint32_t fman_memac_get_event(void *regs, uint32_t ev_mask);
-void FM_ChangeClock(t_Handle h_Fm, int hardwarePortId)
+static void FM_ChangeClock(t_Handle h_Fm, int hardwarePortId)
 {
 	int macId;
 	uint32_t    event, rcr;

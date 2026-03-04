@@ -44,8 +44,14 @@
 #include "enet_ext.h"
 #include "dpaa_integration_ext.h"
 
+#if defined(NCSW_ARM_CORE)
+/* ARM64 — LS1046A has 4x Cortex-A72; no PPC core type */
+#define	INTG_MAX_NUM_OF_CORES	4
+#else
+/* PowerPC — P5020/P3041/P5040 */
 #define	CORE_E500MC
 #define	INTG_MAX_NUM_OF_CORES	24
+#endif
 
 /**************************************************************************//*
  @Description   Part data structure - must be contained in any integration

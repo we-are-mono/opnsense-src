@@ -56,6 +56,39 @@
  * execution reordering with respect to other code/instructions that manipulate
  * the same cacheline. */
 
+#if defined(__aarch64__)
+/*
+ * ARM64 cache operations.
+ *
+ * Portal CE region is mapped Normal Non-Cacheable (matching Linux's
+ * MEMREMAP_WC), so stores go directly to hardware.  However, dcbf is
+ * also used on cacheable DMA memory (FQD, PFDR) in qm.c — there we
+ * need real cache clean to make CPU writes visible to QMan hardware.
+ *
+ * dc cvac (clean by VA to PoC) is the ARM64 equivalent of PPC dcbf.
+ * On NC addresses it's a harmless no-op; on cached addresses it writes
+ * dirty lines back to memory.
+ *
+ * dc zva MUST NOT be used on portal NC memory — it generates a special
+ * bus transaction that can hang the interconnect.  Use memset instead.
+ */
+#define lwsync()	__asm__ __volatile__ ("dmb ish" : : : "memory")
+#define dcbf(addr)	do { \
+	__asm__ __volatile__ ("dc cvac, %0" : : "r"(addr) : "memory"); \
+	__asm__ __volatile__ ("dsb st" : : : "memory"); \
+} while(0)
+#define dcbi(p)		__asm__ __volatile__ ("dsb sy" : : : "memory")
+#define dcbt_ro(addr)	do { } while(0)
+#define dcbt_rw(addr)	do { } while(0)
+#define dcbz_64(p)	do { memset((p), 0, 64); } while(0)
+#define dcbf_64(p)	do { \
+	__asm__ __volatile__ ("dc cvac, %0" : : "r"(p) : "memory"); \
+	__asm__ __volatile__ ("dsb st" : : : "memory"); \
+} while(0)
+#define dcbit_ro(p)	do { } while(0)
+
+#else /* PowerPC */
+
 #define dcbf(addr)  \
     do { \
         __asm__ __volatile__ ("dcbf 0, %0" : : "r" (addr)); \
@@ -131,6 +164,8 @@
 #endif /* CORE_E500MC */
 
 #define dcbi(p) dcbf(p)
+
+#endif /* __aarch64__ */
 
 struct qm_addr {
     void  *addr_ce;    /* cache-enabled */

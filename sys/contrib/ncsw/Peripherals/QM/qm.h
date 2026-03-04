@@ -373,7 +373,11 @@ typedef _Packed struct
 #define QM_CGR_TARGET_DCP(portlaId)    (QM_CGR_TARG_FIRST_DCPORTAL >> portlaId)
 
 
-#define QM_DCP_CFG_ED               0x00000100
+#ifdef __aarch64__
+#define QM_DCP_CFG_ED               0x00001000  /* QMan v3 (LS1046A) */
+#else
+#define QM_DCP_CFG_ED               0x00000100  /* QMan v1/v2 (P5020) */
+#endif
 /*
 #define CGR_VALID                       0x80
 #define CGR_VERB_INIT                   0x50
@@ -467,6 +471,10 @@ typedef struct {
     uint32_t                    pfdrBaseConstant;
     uint16_t                    liodn;
     t_QmDcPortalParams          dcPortalsParams[DPAA_MAX_NUM_OF_DC_PORTALS];
+    void                        *p_FqdBaseExt;       /* Pre-allocated FQD, or NULL */
+    uint32_t                    fqdSizeExt;
+    void                        *p_PfdrBaseExt;      /* Pre-allocated PFDR, or NULL */
+    uint32_t                    pfdrSizeExt;
 } t_QmDriverParams;
 
 typedef struct {
@@ -479,6 +487,8 @@ typedef struct {
     t_QmRegs                    *p_QmRegs;
     uint32_t                    *p_FqdBase;
     uint32_t                    *p_PfdrBase;
+    bool                        fqdExternal;         /* FQD memory externally allocated */
+    bool                        pfdrExternal;        /* PFDR memory externally allocated */
     uint32_t                    exceptions;
     t_QmExceptionsCallback      *f_Exception;
     t_Handle                    h_App;
