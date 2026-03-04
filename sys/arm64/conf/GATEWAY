@@ -47,6 +47,7 @@ device		sdhci
 # I2C (board-specific)
 device		vf_i2c			# Freescale Vybrid / QorIQ I2C controller
 device		pca954x		# NXP PCA9545/9546/9548 I2C mux/switch
+device		ina2xx			# TI INA219/INA226/INA234 power monitor
 # pcf2131 is built as an out-of-tree module in opnsense-deps/drivers/pcf2131/
 
 # GPIO power-off (STUSB4500 USB-C PD reset)

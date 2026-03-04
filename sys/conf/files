@@ -1838,6 +1838,7 @@ dev/iicbus/rtc/rv3032.c		optional rv3032 iicbus fdt
 dev/iicbus/rtc/rx8803.c		optional rx8803 iicbus fdt
 dev/iicbus/rtc/s35390a.c	optional s35390a
 dev/iicbus/sensor/htu21.c	optional htu21
+dev/iicbus/sensor/ina2xx.c	optional ina2xx
 dev/iicbus/sensor/lm75.c	optional lm75
 dev/iicbus/sensor/max44009.c	optional max44009
 dev/iicbus/gpio/pcf8574.c	optional pcf8574
