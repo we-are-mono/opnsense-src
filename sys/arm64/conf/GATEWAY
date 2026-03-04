@@ -56,6 +56,7 @@ device		gpiopower
 # DPAA1 (FMan/QMan/BMan) -- NXP LS1046A packet acceleration
 include		"dpaa/config.dpaa_arm64"
 device		dpaa
+options 	QMAN_CEETM_SUPPORT
 device		sff			# Small Form Factor Transceivers (SFP+)
 
 # caam is built as an out-of-tree module in opnsense-deps/drivers/caam/
