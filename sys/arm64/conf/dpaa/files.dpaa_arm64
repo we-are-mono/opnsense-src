@@ -111,3 +111,15 @@ dev/dpaa/fman_chardev.c			optional dpaa fdt	\
 	no-depend compile-with "${FMCD_COMPILE_CMD}"
 dev/dpaa/fman_fdt.c				optional dpaa fdt	\
 	no-depend compile-with "${DPAA_COMPILE_CMD}"
+# mEMAC external MDIO controller (fsl,fman-memac-mdio)
+dev/dpaa/memac_mdio.c				optional dpaa fdt	\
+	no-depend compile-with "${DPAA_COMPILE_CMD}"
+# Ethernet driver (reuses dTSEC wrapper with mEMAC via NCSW FM_MAC API)
+dev/dpaa/if_dtsec.c				optional dpaa fdt	\
+	no-depend compile-with "${DPAA_COMPILE_CMD}"
+dev/dpaa/if_dtsec_fdt.c			optional dpaa fdt	\
+	no-depend compile-with "${DPAA_COMPILE_CMD}"
+dev/dpaa/if_dtsec_im.c				optional dpaa fdt	\
+	no-depend compile-with "${DPAA_COMPILE_CMD}"
+dev/dpaa/if_dtsec_rm.c				optional dpaa fdt	\
+	no-depend compile-with "${DPAA_COMPILE_CMD}"
