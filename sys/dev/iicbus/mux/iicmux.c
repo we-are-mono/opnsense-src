@@ -279,7 +279,8 @@ iicmux_attach_children(struct iicmux_softc *sc)
 			    idx, sc->numbuses);
 			continue;
 		}
-		sc->childdevs[idx] = device_add_child(sc->dev, "iicbus", -1);
+		sc->childdevs[idx] = device_add_child(sc->dev,
+		    "iicbus", -1);
 		sc->childnodes[idx] = child;
 		if (sc->maxbus < (int)idx)
 			sc->maxbus = idx;
