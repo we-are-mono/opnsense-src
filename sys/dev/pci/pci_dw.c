@@ -366,64 +366,79 @@ pci_dw_setup_hw(struct pci_dw_softc *sc)
 			return (rv);
 	}
 
-	/* Adjust number of lanes */
-	reg = DBI_RD4(sc, DW_PORT_LINK_CTRL);
-	reg &= ~PORT_LINK_CAPABLE(~0);
-	switch (sc->num_lanes) {
-	case 1:
-		reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_1);
-		break;
-	case 2:
-		reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_2);
-		break;
-	case 4:
-		reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_4);
-		break;
-	case 8:
-		reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_8);
-		break;
-	case 16:
-		reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_16);
-		break;
-	case 32:
-		reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_32);
-		break;
-	default:
-		device_printf(sc->dev,
-		    "'num-lanes' property have invalid value: %d\n",
-		    sc->num_lanes);
-		return (EINVAL);
-	}
-	DBI_WR4(sc, DW_PORT_LINK_CTRL, reg);
+	/*
+	 * Adjust number of lanes and trigger link retraining only if
+	 * "num-lanes" is explicitly specified in DT.  When absent
+	 * (num_lanes == 0), preserve the link configuration established
+	 * by firmware/bootloader.  This matches Linux behavior where
+	 * dw_pcie_link_set_max_link_width() returns early if num_lanes
+	 * is zero.
+	 */
+	if (sc->num_lanes > 0) {
+		reg = DBI_RD4(sc, DW_PORT_LINK_CTRL);
+		reg &= ~PORT_LINK_CAPABLE(~0);
+		switch (sc->num_lanes) {
+		case 1:
+			reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_1);
+			break;
+		case 2:
+			reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_2);
+			break;
+		case 4:
+			reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_4);
+			break;
+		case 8:
+			reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_8);
+			break;
+		case 16:
+			reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_16);
+			break;
+		case 32:
+			reg |= PORT_LINK_CAPABLE(PORT_LINK_CAPABLE_32);
+			break;
+		default:
+			device_printf(sc->dev,
+			    "'num-lanes' property have invalid value: %d\n",
+			    sc->num_lanes);
+			return (EINVAL);
+		}
+		DBI_WR4(sc, DW_PORT_LINK_CTRL, reg);
 
-	/* And link width */
-	reg = DBI_RD4(sc, DW_GEN2_CTRL);
-	reg &= ~GEN2_CTRL_NUM_OF_LANES(~0);
-	switch (sc->num_lanes) {
-	case 1:
-		reg |= GEN2_CTRL_NUM_OF_LANES(GEN2_CTRL_NUM_OF_LANES_1);
-		break;
-	case 2:
-		reg |= GEN2_CTRL_NUM_OF_LANES(GEN2_CTRL_NUM_OF_LANES_2);
-		break;
-	case 4:
-		reg |= GEN2_CTRL_NUM_OF_LANES(GEN2_CTRL_NUM_OF_LANES_4);
-		break;
-	case 8:
-		reg |= GEN2_CTRL_NUM_OF_LANES(GEN2_CTRL_NUM_OF_LANES_8);
-		break;
-	case 16:
-		reg |= GEN2_CTRL_NUM_OF_LANES(GEN2_CTRL_NUM_OF_LANES_16);
-		break;
-	case 32:
-		reg |= GEN2_CTRL_NUM_OF_LANES(GEN2_CTRL_NUM_OF_LANES_32);
-		break;
-	}
-	DBI_WR4(sc, DW_GEN2_CTRL, reg);
+		/* And link width */
+		reg = DBI_RD4(sc, DW_GEN2_CTRL);
+		reg &= ~GEN2_CTRL_NUM_OF_LANES(~0);
+		switch (sc->num_lanes) {
+		case 1:
+			reg |= GEN2_CTRL_NUM_OF_LANES(
+			    GEN2_CTRL_NUM_OF_LANES_1);
+			break;
+		case 2:
+			reg |= GEN2_CTRL_NUM_OF_LANES(
+			    GEN2_CTRL_NUM_OF_LANES_2);
+			break;
+		case 4:
+			reg |= GEN2_CTRL_NUM_OF_LANES(
+			    GEN2_CTRL_NUM_OF_LANES_4);
+			break;
+		case 8:
+			reg |= GEN2_CTRL_NUM_OF_LANES(
+			    GEN2_CTRL_NUM_OF_LANES_8);
+			break;
+		case 16:
+			reg |= GEN2_CTRL_NUM_OF_LANES(
+			    GEN2_CTRL_NUM_OF_LANES_16);
+			break;
+		case 32:
+			reg |= GEN2_CTRL_NUM_OF_LANES(
+			    GEN2_CTRL_NUM_OF_LANES_32);
+			break;
+		}
+		DBI_WR4(sc, DW_GEN2_CTRL, reg);
 
-	reg = DBI_RD4(sc, DW_GEN2_CTRL);
-	reg |= DIRECT_SPEED_CHANGE;
-	DBI_WR4(sc, DW_GEN2_CTRL, reg);
+		reg = DBI_RD4(sc, DW_GEN2_CTRL);
+		reg |= DIRECT_SPEED_CHANGE;
+		DBI_WR4(sc, DW_GEN2_CTRL, reg);
+	}
 
 	return (0);
 }
@@ -725,8 +740,8 @@ pci_dw_init(device_t dev)
 	rv = OF_getencprop(sc->node, "num-lanes", &sc->num_lanes,
 	    sizeof(sc->num_lanes));
 	if (rv != sizeof(sc->num_lanes))
-		sc->num_lanes = 1;
-	if (sc->num_lanes != 1 && sc->num_lanes != 2 &&
+		sc->num_lanes = 0;
+	if (sc->num_lanes != 0 && sc->num_lanes != 1 && sc->num_lanes != 2 &&
 	    sc->num_lanes != 4 && sc->num_lanes != 8) {
 		device_printf(dev,
 		    "invalid number of lanes: %d\n",sc->num_lanes);
