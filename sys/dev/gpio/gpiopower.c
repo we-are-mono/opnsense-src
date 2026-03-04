@@ -98,7 +98,7 @@ gpiopower_attach(device_t dev)
 		sc->sc_timeout = fdt32_to_cpu(prop) * 1000;
 
 	EVENTHANDLER_REGISTER(shutdown_final, gpiopower_assert, dev,
-	    SHUTDOWN_PRI_LAST);
+	    SHUTDOWN_PRI_LAST - 1);
 
 	return (0);
 }
