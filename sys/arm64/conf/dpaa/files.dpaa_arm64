@@ -1,0 +1,6 @@
+
+# NetCommSW drivers — ARM64 variant
+# Identical source list to powerpc/conf/dpaa/files.dpaa except:
+# - core.c     -> core_arm64.c  (ARM64 CORE_GetId etc.)
+# - xx.c       -> xx_arm64.c    (no PowerPC ccsrbar/LAW/TLB deps)
+# - if_dtsec*  excluded         (LS1046A uses mEMAC, not dTSEC)

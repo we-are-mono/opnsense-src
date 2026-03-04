@@ -1,0 +1,84 @@
+#
+# MONO-GATEWAY -- NXP LS1046A with DPAA1 + CAAM for OPNsense
+#
+# Based on GENERIC (like SMP-ARM) with hardware-specific additions:
+#   - DPAA1 packet acceleration (FMan/QMan/BMan)
+#   - CAAM crypto accelerator (JR + QI paths)
+#   - GPY115 PHY, SFP+, I2C sensors
+#   - Early printf via QorIQ ns16550
+#
+
+include		GENERIC
+
+ident		MONO-GATEWAY
+
+# Disable debug for production
+nooptions	INVARIANTS
+nooptions	INVARIANT_SUPPORT
+nooptions	WITNESS
+nooptions	WITNESS_SKIPSPIN
+nooptions	LOCK_PROFILING
+
+# OPNsense standard features (from SMP-ARM)
+options 	DDB
+options 	GEOM_BDE
+options 	GEOM_ELI
+options 	GEOM_MIRROR
+options 	IPFIREWALL_DEFAULT_TO_ACCEPT
+options 	IPFIREWALL_VERBOSE
+options 	IPSTEALTH
+options 	MROUTING
+options 	PPS_SYNC
+options 	TCP_SIGNATURE
+
+# Platform
+options 	SOC_NXP_LS
+
+# Root filesystem (label set by opnsense-build arm.sh)
+options 	ROOTDEVNAME=\"ufs:/dev/ufs/OPNsense_ARM\"
+
+# Early printf for debugging
+options 	SOCDEV_PA=0x2000000
+options 	EARLY_PRINTF=qoriq
+
+# eMMC (QorIQ ESDHC)
+device		sdhci
+
+# I2C (board-specific)
+device		vf_i2c			# Freescale Vybrid / QorIQ I2C controller
+device		pca954x		# NXP PCA9545/9546/9548 I2C mux/switch
+# pcf2131 is built as an out-of-tree module in opnsense-deps/drivers/pcf2131/
+
+# GPIO power-off (STUSB4500 USB-C PD reset)
+device		gpiopower
+
+device		sff			# Small Form Factor Transceivers (SFP+)
+
+# caam is built as an out-of-tree module in opnsense-deps/drivers/caam/
+
+# Packet filter
+device		pf
+device		pflog
+device		pfsync
+device		carp
+
+# Networking
+device		lagg			# Link aggregation
+device		if_bridge		# Bridge interface
+device		enc			# IPsec enc(4) interface
+device		gif			# IPv6/IPv4 tunneling
+device		gre			# GRE tunneling
+device		tuntap			# Tunnel/TAP
+
+# OPNsense extras
+device		wlan_acl
+device		wlan_xauth
+device		u3g
+device		uftdi
+device		umodem
+device		uplcom
+device		uvisor
+device		uvscom
+
+# DTBs
+makeoptions	MODULES_EXTRA+="dtb/freescale"
