@@ -31,6 +31,7 @@
 #include <sys/systm.h>
 #include <sys/conf.h>
 #include <sys/bus.h>
+#include <sys/endian.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
@@ -47,6 +48,28 @@
 #include <dev/ofw/ofw_bus_subr.h>
 
 #include "gpio_if.h"
+
+/*
+ * QorIQ GPIO registers are big-endian.  bus_read_4/bus_write_4 return/accept
+ * data in CPU-native byte order.  On PowerPC (BE) this is a no-op, but on
+ * ARM64 (LE) the bytes get swapped, which shifts bit positions within the
+ * 32-bit word and breaks the pin ↔ bit mapping.  Wrap all register access
+ * with be32toh/htobe32 so pin numbering matches the hardware datasheet on
+ * both architectures.
+ */
+static inline uint32_t
+gpio_read(struct qoriq_gpio_softc *sc, bus_size_t off)
+{
+
+	return (be32toh(bus_read_4(sc->sc_mem, off)));
+}
+
+static inline void
+gpio_write(struct qoriq_gpio_softc *sc, bus_size_t off, uint32_t val)
+{
+
+	bus_write_4(sc->sc_mem, off, htobe32(val));
+}
 
 static device_t
 qoriq_gpio_get_bus(device_t dev)
@@ -112,20 +135,20 @@ qoriq_gpio_pin_configure(device_t dev, uint32_t pin, uint32_t flags)
 	}
 
 	if (flags & GPIO_PIN_INPUT) {
-		reg = bus_read_4(sc->sc_mem, GPIO_GPDIR);
+		reg = gpio_read(sc, GPIO_GPDIR);
 		reg &= ~(1 << (31 - pin));
-		bus_write_4(sc->sc_mem, GPIO_GPDIR, reg);
+		gpio_write(sc, GPIO_GPDIR, reg);
 	}
 	else if (flags & GPIO_PIN_OUTPUT) {
-		reg = bus_read_4(sc->sc_mem, GPIO_GPDIR);
+		reg = gpio_read(sc, GPIO_GPDIR);
 		reg |= (1 << (31 - pin));
-		bus_write_4(sc->sc_mem, GPIO_GPDIR, reg);
-		reg = bus_read_4(sc->sc_mem, GPIO_GPODR);
+		gpio_write(sc, GPIO_GPDIR, reg);
+		reg = gpio_read(sc, GPIO_GPODR);
 		if (flags & GPIO_PIN_OPENDRAIN)
 			reg |= (1 << (31 - pin));
 		else
 			reg &= ~(1 << (31 - pin));
-		bus_write_4(sc->sc_mem, GPIO_GPODR, reg);
+		gpio_write(sc, GPIO_GPODR, reg);
 	}
 	sc->sc_pins[pin].gp_flags = flags;
 
@@ -183,10 +206,10 @@ qoriq_gpio_pin_set(device_t dev, uint32_t pin, unsigned int value)
 	GPIO_LOCK(sc);
 	pinbit = 31 - pin;
 
-	outvals = bus_read_4(sc->sc_mem, GPIO_GPDAT);
+	outvals = gpio_read(sc, GPIO_GPDAT);
 	outvals &= ~(1 << pinbit);
 	outvals |= (value << pinbit);
-	bus_write_4(sc->sc_mem, GPIO_GPDAT, outvals);
+	gpio_write(sc, GPIO_GPDAT, outvals);
 
 	GPIO_UNLOCK(sc);
 
@@ -202,7 +225,7 @@ qoriq_gpio_pin_get(device_t dev, uint32_t pin, unsigned int *value)
 	if (!VALID_PIN(pin))
 		return (EINVAL);
 
-	*value = (bus_read_4(sc->sc_mem, GPIO_GPDAT) >> (31 - pin)) & 1;
+	*value = (gpio_read(sc, GPIO_GPDAT) >> (31 - pin)) & 1;
 
 	return (0);
 }
@@ -219,9 +242,9 @@ qoriq_gpio_pin_toggle(device_t dev, uint32_t pin)
 
 	GPIO_LOCK(sc);
 
-	val = bus_read_4(sc->sc_mem, GPIO_GPDAT);
+	val = gpio_read(sc, GPIO_GPDAT);
 	val ^= (1 << (31 - pin));
-	bus_write_4(sc->sc_mem, GPIO_GPDAT, val);
+	gpio_write(sc, GPIO_GPDAT, val);
 
 	GPIO_UNLOCK(sc);
 
@@ -260,8 +283,8 @@ qoriq_gpio_pin_access_32(device_t dev, uint32_t first_pin, uint32_t clear_pins,
 		return (EINVAL);
 
 	GPIO_LOCK(sc);
-	hwstate = bus_read_4(sc->sc_mem, GPIO_GPDAT);
-	bus_write_4(sc->sc_mem, GPIO_GPDAT,
+	hwstate = gpio_read(sc, GPIO_GPDAT);
+	gpio_write(sc, GPIO_GPDAT,
 	    (hwstate & ~clear_pins) ^ change_pins);
 	GPIO_UNLOCK(sc);
 
@@ -310,11 +333,11 @@ qoriq_gpio_pin_config_32(device_t dev, uint32_t first_pin, uint32_t num_pins,
 
 	GPIO_LOCK(sc);
 
-	reg = (bus_read_4(sc->sc_mem, GPIO_GPDIR) & ~mask) | dir;
-	bus_write_4(sc->sc_mem, GPIO_GPDIR, reg);
+	reg = (gpio_read(sc, GPIO_GPDIR) & ~mask) | dir;
+	gpio_write(sc, GPIO_GPDIR, reg);
 
-	reg = (bus_read_4(sc->sc_mem, GPIO_GPODR) & ~mask) | odr;
-	bus_write_4(sc->sc_mem, GPIO_GPODR, reg);
+	reg = (gpio_read(sc, GPIO_GPODR) & ~mask) | odr;
+	gpio_write(sc, GPIO_GPODR, reg);
 
 	for (i = 0; i < num_pins; i++)
 		sc->sc_pins[i].gp_flags = newflags[i];
@@ -381,7 +404,7 @@ qoriq_gpio_attach(device_t dev)
 	 * devices ignore writes and read 0's in undefined portions of the map.
 	 */
 	if (ofw_bus_is_compatible(dev, "fsl,qoriq-gpio"))
-		bus_write_4(sc->sc_mem, GPIO_GPIBE, 0xffffffff);
+		gpio_write(sc, GPIO_GPIBE, 0xffffffff);
 
 	OF_device_register_xref(OF_xref_from_node(ofw_bus_get_node(dev)), dev);
 
