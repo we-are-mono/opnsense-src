@@ -636,8 +636,8 @@ dev/iicbus/controller/vybrid/vf_i2c_acpi.c	optional vf_i2c iicbus acpi soc_nxp_l
 dev/iicbus/controller/vybrid/vf_i2c_fdt.c	optional vf_i2c iicbus fdt soc_nxp_ls
 arm64/qoriq/qoriq_dw_pci.c			optional pci fdt soc_nxp_ls
 arm64/qoriq/qoriq_gpio_pic.c			optional gpio fdt soc_nxp_ls
-arm64/qoriq/qoriq_therm.c			optional pci fdt soc_nxp_ls
-arm64/qoriq/qoriq_therm_if.m			optional pci fdt soc_nxp_ls
+arm64/qoriq/qoriq_therm.c			optional fdt soc_nxp_ls
+arm64/qoriq/qoriq_therm_if.m			optional fdt soc_nxp_ls
 arm64/qoriq/clk/ls1028a_clkgen.c		optional clk soc_nxp_ls fdt
 arm64/qoriq/clk/ls1028a_flexspi_clk.c		optional clk soc_nxp_ls fdt
 arm64/qoriq/clk/ls1046a_clkgen.c		optional clk soc_nxp_ls fdt
