@@ -442,3 +442,9 @@
 	reg = <0 0xc3000000 0 0x800000>;	/* 8MB at 0xC3000000 */
 };
 
+/* PCIe3: Jody W337 WiFi module (NXP 88W9098) */
+&pcie3 {
+	status = "okay";
+	num-lanes = <1>;
+};
+

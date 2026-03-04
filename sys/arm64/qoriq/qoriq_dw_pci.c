@@ -30,6 +30,7 @@
 
 #include <sys/cdefs.h>
 #include <sys/param.h>
+#include <sys/endian.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/devmap.h>
@@ -71,7 +72,7 @@ struct qorif_dw_pci_softc {
 	struct resource 	*irq_res;
 	void			*intr_cookie;
 	struct qoriq_dw_pci_cfg	*soc_cfg;
-
+	bool			big_endian;	/* CCSR registers are BE */
 };
 
 static struct qoriq_dw_pci_cfg ls1043_cfg = {
@@ -100,7 +101,7 @@ static struct ofw_compat_data compat_data[] = {
 	{"fsl,ls1012a-pcie", (uintptr_t)&ls1012_cfg},
 	{"fsl,ls1028a-pcie", (uintptr_t)&ls2028_cfg},
 	{"fsl,ls1043a-pcie", (uintptr_t)&ls1043_cfg},
-	{"fsl,ls1046a-pcie", (uintptr_t)&ls1012_cfg},
+	{"fsl,ls1046a-pcie", (uintptr_t)&ls2028_cfg},
 	{"fsl,ls2080a-pcie", (uintptr_t)&ls2080_cfg},
 	{"fsl,ls2085a-pcie", (uintptr_t)&ls2080_cfg},
 	{"fsl,ls2088a-pcie", (uintptr_t)&ls2028_cfg},
@@ -141,10 +142,11 @@ static int
 qorif_dw_pci_get_link(device_t dev, bool *status)
 {
 	struct qorif_dw_pci_softc *sc;
-	uint32_t reg;
+	uint32_t reg, raw;
 
 	sc = device_get_softc(dev);
-	reg = pci_dw_dbi_rd4(sc->dev, sc->soc_cfg->pex_pf0_dgb);
+	raw = pci_dw_dbi_rd4(sc->dev, sc->soc_cfg->pex_pf0_dgb);
+	reg = sc->big_endian ? bswap32(raw) : raw;
 	reg >>=  sc->soc_cfg->ltssm_bit;
 	reg &= 0x3F;
 	*status = (reg == 0x11) ? true : false;
@@ -198,6 +200,7 @@ qorif_dw_pci_attach(device_t dev)
 	sc->node = node;
 	sc->soc_cfg = (struct qoriq_dw_pci_cfg *)
 	    ofw_bus_search_compatible(dev, compat_data)->ocd_data;
+	sc->big_endian = OF_hasprop(node, "big-endian");
 
 	rid = 0;
 	sc->dw_sc.dbi_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
@@ -233,6 +236,20 @@ qorif_dw_pci_attach(device_t dev)
 		goto out;
 
 	qorif_dw_pci_init(sc);
+
+	/* Report link status */
+	{
+		uint32_t raw, ltssm;
+		bool link_up;
+
+		raw = pci_dw_dbi_rd4(dev, sc->soc_cfg->pex_pf0_dgb);
+		ltssm = sc->big_endian ? bswap32(raw) : raw;
+		ltssm = (ltssm >> sc->soc_cfg->ltssm_bit) & 0x3F;
+		link_up = (ltssm == 0x11);
+		device_printf(dev,
+		    "PCIe link: LTSSM=0x%02x (%s), PEX_PF0_DBG=0x%08x (raw), big_endian=%d\n",
+		    ltssm, link_up ? "L0/up" : "not up", raw, sc->big_endian);
+	}
 
 	/* Setup interrupt  */
 	if (bus_setup_intr(dev, sc->irq_res, INTR_TYPE_MISC | INTR_MPSAFE,
