@@ -126,3 +126,6 @@ dev/dpaa/if_dtsec_rm.c				optional dpaa fdt	\
 # Offline / Header Manipulation ports
 dev/dpaa/dpaa_oh.c				optional dpaa fdt	\
 	no-depend compile-with "${DPAA_COMPILE_CMD}"
+# CEETM egress QoS (Class-based Enqueue/Dequeue Traffic Management)
+dev/dpaa/qman_ceetm.c				optional dpaa fdt	\
+	no-depend compile-with "${DPAA_COMPILE_CMD}"
