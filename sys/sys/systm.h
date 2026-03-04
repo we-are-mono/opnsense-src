@@ -216,6 +216,7 @@ extern early_putc_t *early_putc;
 #define	early_printf_pl011	4
 #define	early_printf_snps	5
 #define	early_printf_sbi	6
+#define	early_printf_qoriq	7
 #else
 #define	CHECK_EARLY_PRINTF(x)	0
 #endif

@@ -107,6 +107,30 @@ early_putc_t *early_putc = uart_ns8250_early_putc;
 #endif /* EARLY_PRINTF */
 
 /*
+ * To use early printf on NXP QorIQ (LS1046A, etc.), add to kernel config:
+ *
+ * options SOCDEV_PA=0x2000000
+ * options EARLY_PRINTF=qoriq
+ *
+ * SOCDEV_PA must be 2MB-aligned (L2 block constraint in locore.S).
+ * The DUART is at SOCDEV_PA + 0x1c0500.
+ */
+#if CHECK_EARLY_PRINTF(qoriq)
+extern uintptr_t socdev_va;
+static void
+uart_qoriq_early_putc(int c)
+{
+	volatile uint8_t *base = (volatile uint8_t *)(socdev_va + 0x1c0500);
+	int limit = 10000;
+
+	while ((base[5] & 0x20) == 0 && --limit > 0)
+		continue;
+	base[0] = c;
+}
+early_putc_t *early_putc = uart_qoriq_early_putc;
+#endif /* CHECK_EARLY_PRINTF(qoriq) */
+
+/*
  * Clear pending interrupts. THRE is cleared by reading IIR. Data
  * that may have been received gets lost here.
  */
