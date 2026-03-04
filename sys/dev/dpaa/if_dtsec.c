@@ -55,12 +55,23 @@
 
 #include "miibus_if.h"
 
+#include "opt_dpaa.h"
+
 #include <contrib/ncsw/inc/integrations/dpaa_integration_ext.h>
 #include <contrib/ncsw/inc/Peripherals/fm_mac_ext.h>
 #include <contrib/ncsw/inc/Peripherals/fm_port_ext.h>
+#include <contrib/ncsw/inc/Peripherals/fm_vsp_ext.h>
+#if (DPAA_VERSION < 11)
+#include <contrib/ncsw/inc/flib/fsl_fman_dtsec.h>
+#endif
 #include <contrib/ncsw/inc/xx_ext.h>
 
 #include "fman.h"
+#include "bman.h"
+
+/* FM port internal header — needed for RCCB register access in stall diag */
+#include <contrib/ncsw/Peripherals/FM/Port/fm_port.h>
+#include "qman.h"
 #include "if_dtsec.h"
 #include "if_dtsec_im.h"
 #include "if_dtsec_rm.h"
@@ -68,7 +79,12 @@
 #define	DTSEC_MIN_FRAME_SIZE	64
 #define	DTSEC_MAX_FRAME_SIZE	9600
 
+#if (DPAA_VERSION < 11)
 #define	DTSEC_REG_MAXFRM	0x110
+#define	DTSEC_REG_GADDR(i)	(0x0a0 + 4*(i))
+#else
+#define	MEMAC_REG_MAXFRM	0x014
+#endif
 
 /**
  * @group dTSEC private defines.
@@ -156,7 +172,7 @@ dtsec_fm_mac_mdio_event_callback(t_Handle h_App,
 	struct dtsec_softc *sc;
 
 	sc = h_App;
-	device_printf(sc->sc_dev, "MDIO event %i: %s.\n", exception,
+	if_printf(sc->sc_ifnet, "MDIO event %i: %s.\n", exception,
 	    dtsec_fm_mac_ex_to_str(exception));
 }
 
@@ -166,7 +182,7 @@ dtsec_fm_mac_exception_callback(t_Handle app, e_FmMacExceptions exception)
 	struct dtsec_softc *sc;
 
 	sc = app;
-	device_printf(sc->sc_dev, "MAC exception %i: %s.\n", exception,
+	if_printf(sc->sc_ifnet, "MAC exception %i: %s.\n", exception,
 	    dtsec_fm_mac_ex_to_str(exception));
 }
 
@@ -214,7 +230,9 @@ dtsec_fm_mac_init(struct dtsec_softc *sc, uint8_t *mac)
 		return (ENXIO);
 	}
 
-	/* Do not inform about pause frames */
+#if (DPAA_VERSION < 11)
+	/* Do not inform about pause frames (dTSEC only; MEMAC has no
+	 * equivalent interrupt — it simply never generates this event). */
 	error = FM_MAC_ConfigException(sc->sc_mach, e_FM_MAC_EX_1G_RX_CTL,
 	    FALSE);
 	if (error != E_OK) {
@@ -223,6 +241,7 @@ dtsec_fm_mac_init(struct dtsec_softc *sc, uint8_t *mac)
 		dtsec_fm_mac_free(sc);
 		return (ENXIO);
 	}
+#endif
 
 	error = FM_MAC_Init(sc->sc_mach);
 	if (error != E_OK) {
@@ -230,6 +249,18 @@ dtsec_fm_mac_init(struct dtsec_softc *sc, uint8_t *mac)
 		    "\n");
 		dtsec_fm_mac_free(sc);
 		return (ENXIO);
+	}
+
+	/* Diagnostic: dump MEMAC IF_MODE and IF_STATUS registers */
+	{
+		uint32_t ifmode = be32toh(bus_read_4(sc->sc_mem, 0x300));
+		uint32_t ifstat = be32toh(bus_read_4(sc->sc_mem, 0x304));
+		device_printf(sc->sc_dev,
+		    "MEMAC IF_MODE=0x%08x IF_STATUS=0x%08x mode=%s\n",
+		    ifmode, ifstat,
+		    (ifmode & 0x3) == 0 ? "XGMII(10G)" :
+		    (ifmode & 0x3) == 2 ? "GMII(1G)" :
+		    (ifmode & 0x3) == 4 ? "RGMII" : "unknown");
 	}
 
 	return (0);
@@ -260,7 +291,7 @@ dtsec_fm_port_rx_exception_callback(t_Handle app,
 	struct dtsec_softc *sc;
 
 	sc = app;
-	device_printf(sc->sc_dev, "RX exception: %i: %s.\n", exception,
+	if_printf(sc->sc_ifnet, "RX exception: %i: %s.\n", exception,
 	    dtsec_fm_port_ex_to_str(exception));
 }
 
@@ -271,7 +302,7 @@ dtsec_fm_port_tx_exception_callback(t_Handle app,
 	struct dtsec_softc *sc;
 
 	sc = app;
-	device_printf(sc->sc_dev, "TX exception: %i: %s.\n", exception,
+	if_printf(sc->sc_ifnet, "TX exception: %i: %s.\n", exception,
 	    dtsec_fm_port_ex_to_str(exception));
 }
 
@@ -305,6 +336,11 @@ dtsec_fm_port_tx_type(enum eth_dev_type type)
 static void
 dtsec_fm_port_free_both(struct dtsec_softc *sc)
 {
+	if (sc->sc_vsph) {
+		FM_VSP_Free(sc->sc_vsph);
+		sc->sc_vsph = NULL;
+	}
+
 	if (sc->sc_rxph) {
 		FM_PORT_Free(sc->sc_rxph);
 		sc->sc_rxph = NULL;
@@ -331,11 +367,48 @@ dtsec_set_mtu(struct dtsec_softc *sc, unsigned int mtu)
 	DTSEC_LOCK_ASSERT(sc);
 
 	if (mtu >= DTSEC_MIN_FRAME_SIZE && mtu <= DTSEC_MAX_FRAME_SIZE) {
+#if (DPAA_VERSION < 11)
 		bus_write_4(sc->sc_mem, DTSEC_REG_MAXFRM, mtu);
+#else
+		bus_write_4(sc->sc_mem, MEMAC_REG_MAXFRM,
+		    htobe32((uint32_t)mtu));
+#endif
 		return (mtu);
 	}
 
 	return (0);
+}
+
+static u_int
+dtsec_hash_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	struct dtsec_softc *sc = arg;
+
+	FM_MAC_AddHashMacAddr(sc->sc_mach, (t_EnetAddr *)LLADDR(sdl));
+
+	return (1);
+}
+
+static void
+dtsec_setup_multicast(struct dtsec_softc *sc)
+{
+#if (DPAA_VERSION < 11)
+	int i;
+
+	if (if_getflags(sc->sc_ifnet) & IFF_ALLMULTI) {
+		for (i = 0; i < 8; i++)
+			bus_write_4(sc->sc_mem, DTSEC_REG_GADDR(i), 0xFFFFFFFF);
+
+		return;
+	}
+
+	fman_dtsec_reset_filter_table(rman_get_virtual(sc->sc_mem),
+	    true, false);
+#else
+	/* mEMAC: no hash reset API — SetPromiscuous(false) clears filter */
+	FM_MAC_SetPromiscuous(sc->sc_mach, false);
+#endif
+	if_foreach_llmaddr(sc->sc_ifnet, dtsec_hash_maddr, sc);
 }
 
 static int
@@ -356,6 +429,8 @@ dtsec_if_enable_locked(struct dtsec_softc *sc)
 	error = FM_PORT_Enable(sc->sc_txph);
 	if (error != E_OK)
 		return (EIO);
+
+	dtsec_setup_multicast(sc);
 
 	if_setdrvflagbits(sc->sc_ifnet, IFF_DRV_RUNNING, 0);
 
@@ -423,9 +498,38 @@ dtsec_if_ioctl(if_t ifp, u_long command, caddr_t data)
 
 	case SIOCGIFMEDIA:
 	case SIOCSIFMEDIA:
-		error = ifmedia_ioctl(ifp, ifr, &sc->sc_mii->mii_media,
-		    command);
+		if (sc->sc_mii != NULL)
+			error = ifmedia_ioctl(ifp, ifr,
+			    &sc->sc_mii->mii_media, command);
+		else
+			error = ENOTTY;
 		break;
+
+	case SIOCSIFCAP: {
+		int mask;
+
+		mask = ifr->ifr_reqcap ^ if_getcapenable(ifp);
+
+		if (mask & IFCAP_TXCSUM) {
+			if_togglecapenable(ifp, IFCAP_TXCSUM);
+			if (if_getcapenable(ifp) & IFCAP_TXCSUM)
+				if_sethwassist(ifp, if_gethwassist(ifp) |
+				    (CSUM_IP | CSUM_IP_TCP | CSUM_IP_UDP));
+			else
+				if_sethwassist(ifp, if_gethwassist(ifp) &
+				    ~(CSUM_IP | CSUM_IP_TCP | CSUM_IP_UDP));
+		}
+		if (mask & IFCAP_TXCSUM_IPV6) {
+			if_togglecapenable(ifp, IFCAP_TXCSUM_IPV6);
+			if (if_getcapenable(ifp) & IFCAP_TXCSUM_IPV6)
+				if_sethwassist(ifp, if_gethwassist(ifp) |
+				    (CSUM_IP6_TCP | CSUM_IP6_UDP));
+			else
+				if_sethwassist(ifp, if_gethwassist(ifp) &
+				    ~(CSUM_IP6_TCP | CSUM_IP6_UDP));
+		}
+		break;
+	}
 
 	default:
 		error = ether_ioctl(ifp, command, data);
@@ -441,10 +545,11 @@ dtsec_if_tick(void *arg)
 
 	sc = arg;
 
-	/* TODO */
 	DTSEC_LOCK(sc);
 
-	mii_tick(sc->sc_mii);
+	if (sc->sc_mii != NULL)
+		mii_tick(sc->sc_mii);
+
 	callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
 
 	DTSEC_UNLOCK(sc);
@@ -472,13 +577,12 @@ dtsec_if_init_locked(struct dtsec_softc *sc)
 	error = FM_MAC_ModifyMacAddr(sc->sc_mach,
 	    (t_EnetAddr *)if_getlladdr(sc->sc_ifnet));
 	if (error != E_OK) {
-		device_printf(sc->sc_dev, "couldn't set MAC address.\n");
+		if_printf(sc->sc_ifnet, "couldn't set MAC address.\n");
 		goto err;
 	}
 
-	/* Start MII polling */
-	if (sc->sc_mii)
-		callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
+	/* Start MII polling / periodic diagnostics */
+	callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
 
 	if (if_getflags(sc->sc_ifnet) & IFF_UP) {
 		error = dtsec_if_enable_locked(sc);
@@ -494,7 +598,7 @@ dtsec_if_init_locked(struct dtsec_softc *sc)
 
 err:
 	dtsec_if_deinit_locked(sc);
-	device_printf(sc->sc_dev, "initialization error.\n");
+	if_printf(sc->sc_ifnet, "initialization error.\n");
 	return;
 }
 
@@ -522,6 +626,12 @@ dtsec_if_start(if_t ifp)
 }
 
 static void
+dtsec_if_qflush(if_t ifp)
+{
+	/* No software queue — nothing to flush */
+}
+
+static void
 dtsec_if_watchdog(if_t ifp)
 {
 	/* TODO */
@@ -539,7 +649,8 @@ dtsec_ifmedia_upd(if_t ifp)
 	struct dtsec_softc *sc = if_getsoftc(ifp);
 
 	DTSEC_LOCK(sc);
-	mii_mediachg(sc->sc_mii);
+	if (sc->sc_mii != NULL)
+		mii_mediachg(sc->sc_mii);
 	DTSEC_UNLOCK(sc);
 
 	return (0);
@@ -552,10 +663,15 @@ dtsec_ifmedia_sts(if_t ifp, struct ifmediareq *ifmr)
 
 	DTSEC_LOCK(sc);
 
-	mii_pollstat(sc->sc_mii);
-
-	ifmr->ifm_active = sc->sc_mii->mii_media_active;
-	ifmr->ifm_status = sc->sc_mii->mii_media_status;
+	if (sc->sc_mii != NULL) {
+		mii_pollstat(sc->sc_mii);
+		ifmr->ifm_active = sc->sc_mii->mii_media_active;
+		ifmr->ifm_status = sc->sc_mii->mii_media_status;
+	} else {
+		/* 10G port with no PHY — report fixed 10G media, always up */
+		ifmr->ifm_active = IFM_ETHER | IFM_10G_SR | IFM_FDX;
+		ifmr->ifm_status = IFM_AVALID | IFM_ACTIVE;
+	}
 
 	DTSEC_UNLOCK(sc);
 }
@@ -580,7 +696,7 @@ dtsec_configure_mode(struct dtsec_softc *sc)
 	if (sc->sc_mode == DTSEC_MODE_REGULAR) {
 		sc->sc_port_rx_init = dtsec_rm_fm_port_rx_init;
 		sc->sc_port_tx_init = dtsec_rm_fm_port_tx_init;
-		sc->sc_start_locked = dtsec_rm_if_start_locked;
+		/* RM uses if_transmit, no sc_start_locked needed */
 	} else {
 		sc->sc_port_rx_init = dtsec_im_fm_port_rx_init;
 		sc->sc_port_tx_init = dtsec_im_fm_port_tx_init;
@@ -589,6 +705,129 @@ dtsec_configure_mode(struct dtsec_softc *sc)
 
 	device_printf(sc->sc_dev, "Configured for %s mode.\n",
 	    (sc->sc_mode == DTSEC_MODE_REGULAR) ? "regular" : "independent");
+}
+
+static int
+dtsec_sysctl_bman_free(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint32_t count;
+
+	if (sc->sc_rx_pool == NULL)
+		count = 0;
+	else
+		count = bman_count(sc->sc_rx_pool);
+
+	return (sysctl_handle_int(oidp, &count, 0, req));
+}
+
+static int
+dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	int val = 0;
+	int error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error || req->newptr == NULL)
+		return (error);
+
+	if (val != 0) {
+		uint32_t bcount = sc->sc_rx_pool ?
+		    bman_count(sc->sc_rx_pool) : 0;
+		printf("%s: DIAG bman_free=%u bman_total=%u bpid=%u "
+		    "rx_fqid=%u\n",
+		    if_name(sc->sc_ifnet), bcount,
+		    sc->sc_rx_buf_total, sc->sc_rx_bpid,
+		    sc->sc_rx_fqr[0] ? qman_fqr_get_base_fqid(sc->sc_rx_fqr[0]) : 0);
+		qman_portal_dqrr_diag();
+		if (sc->sc_rxph != NULL) {
+			printf("%s: FMan RX: frame=%u discard=%u "
+			    "bad=%u filter=%u oobd=%u enq=%u\n",
+			    if_name(sc->sc_ifnet),
+			    FM_PORT_GetCounter(sc->sc_rxph,
+			        e_FM_PORT_COUNTERS_FRAME),
+			    FM_PORT_GetCounter(sc->sc_rxph,
+			        e_FM_PORT_COUNTERS_DISCARD_FRAME),
+			    FM_PORT_GetCounter(sc->sc_rxph,
+			        e_FM_PORT_COUNTERS_RX_BAD_FRAME),
+			    FM_PORT_GetCounter(sc->sc_rxph,
+			        e_FM_PORT_COUNTERS_RX_FILTER_FRAME),
+			    FM_PORT_GetCounter(sc->sc_rxph,
+			        e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD),
+			    FM_PORT_GetCounter(sc->sc_rxph,
+			        e_FM_PORT_COUNTERS_ENQ_TOTAL));
+		}
+		if (sc->sc_txph != NULL) {
+			printf("%s: FMan TX: frame=%u discard=%u "
+			    "len_err=%u unsup=%u deq=%u deq_dflt=%u "
+			    "deq_conf=%u\n",
+			    if_name(sc->sc_ifnet),
+			    FM_PORT_GetCounter(sc->sc_txph,
+			        e_FM_PORT_COUNTERS_FRAME),
+			    FM_PORT_GetCounter(sc->sc_txph,
+			        e_FM_PORT_COUNTERS_DISCARD_FRAME),
+			    FM_PORT_GetCounter(sc->sc_txph,
+			        e_FM_PORT_COUNTERS_LENGTH_ERR),
+			    FM_PORT_GetCounter(sc->sc_txph,
+			        e_FM_PORT_COUNTERS_UNSUPPRTED_FORMAT),
+			    FM_PORT_GetCounter(sc->sc_txph,
+			        e_FM_PORT_COUNTERS_DEQ_TOTAL),
+			    FM_PORT_GetCounter(sc->sc_txph,
+			        e_FM_PORT_COUNTERS_DEQ_FROM_DEFAULT),
+			    FM_PORT_GetCounter(sc->sc_txph,
+			        e_FM_PORT_COUNTERS_DEQ_CONFIRM));
+		}
+		if (sc->sc_mach != NULL) {
+			t_FmMacStatistics ms;
+			if (FM_MAC_GetStatistics(sc->sc_mach, &ms) == E_OK) {
+				printf("%s: MAC: rxPkts=%llu rxBytes=%llu "
+				    "rxDiscard=%llu rxErr=%llu "
+				    "txPkts=%llu txBytes=%llu "
+				    "txErr=%llu\n",
+				    if_name(sc->sc_ifnet),
+				    (unsigned long long)ms.ifInPkts,
+				    (unsigned long long)ms.ifInOctets,
+				    (unsigned long long)ms.ifInDiscards,
+				    (unsigned long long)ms.ifInErrors,
+				    (unsigned long long)ms.ifOutPkts,
+				    (unsigned long long)ms.ifOutOctets,
+				    (unsigned long long)ms.ifOutErrors);
+			}
+		}
+	}
+
+	return (0);
+}
+
+static uint64_t
+dtsec_get_counter(if_t ifp, ift_counter cnt)
+{
+	struct dtsec_softc *sc = if_getsoftc(ifp);
+	t_FmMacStatistics ms;
+
+	if (sc->sc_mach != NULL &&
+	    FM_MAC_GetStatistics(sc->sc_mach, &ms) == E_OK) {
+		switch (cnt) {
+		case IFCOUNTER_IPACKETS:
+			return (ms.ifInPkts);
+		case IFCOUNTER_OPACKETS:
+			return (ms.ifOutPkts);
+		case IFCOUNTER_IBYTES:
+			return (ms.ifInOctets);
+		case IFCOUNTER_OBYTES:
+			return (ms.ifOutOctets);
+		case IFCOUNTER_IERRORS:
+			return (ms.ifInErrors);
+		case IFCOUNTER_OERRORS:
+			return (ms.ifOutErrors);
+		case IFCOUNTER_IMCASTS:
+			return (ms.ifInMcastPkts);
+		default:
+			break;
+		}
+	}
+	return (if_get_counter_default(ifp, cnt));
 }
 
 int
@@ -628,6 +867,9 @@ dtsec_attach(device_t dev)
 
 	if ((error = fman_get_bushandle(parent, &sc->sc_fm_base)) != 0)
 		return (error);
+
+	fman_get_pcd_handle(parent, &sc->sc_pcdh);
+	fman_get_netenv_handle(parent, &sc->sc_netenvh);
 
 	/* Configure working mode */
 	dtsec_configure_mode(sc);
@@ -676,21 +918,33 @@ dtsec_attach(device_t dev)
 		return (ENXIO);
 	}
 
+	if (sc->sc_mode == DTSEC_MODE_REGULAR) {
+		error = dtsec_rm_pcd_init(sc);
+		if (error != 0)
+			device_printf(dev,
+			    "PCD init failed, continuing without RSS\n");
+	}
+
 	/* Create network interface for upper layers */
 	ifp = sc->sc_ifnet = if_alloc(IFT_ETHER);
 	if_setsoftc(ifp, sc);
 
-	if_setflags(ifp, IFF_SIMPLEX | IFF_BROADCAST);
+	if_setflags(ifp, IFF_SIMPLEX | IFF_BROADCAST | IFF_MULTICAST);
 	if_setinitfn(ifp, dtsec_if_init);
-	if_setstartfn(ifp, dtsec_if_start);
 	if_setioctlfn(ifp, dtsec_if_ioctl);
-	if_setsendqlen(ifp, IFQ_MAXLEN);
+	if_setgetcounterfn(ifp, dtsec_get_counter);
 
-	if (sc->sc_phy_addr >= 0)
-		if_initname(ifp, device_get_name(sc->sc_dev),
-		    device_get_unit(sc->sc_dev));
-	else
-		if_initname(ifp, "dtsec_phy", device_get_unit(sc->sc_dev));
+	if (sc->sc_mode == DTSEC_MODE_REGULAR) {
+		/* Modern if_transmit: per-CPU TX FQs, no locks, no sendq */
+		if_settransmitfn(ifp, dtsec_rm_if_transmit);
+		if_setqflushfn(ifp, dtsec_if_qflush);
+	} else {
+		/* Legacy if_start for Independent Mode */
+		if_setstartfn(ifp, dtsec_if_start);
+		if_setsendqlen(ifp, IFQ_MAXLEN);
+	}
+
+	if_initname(ifp, "dtsec", device_get_unit(sc->sc_dev));
 
 	/* TODO */
 #if 0
@@ -698,21 +952,58 @@ dtsec_attach(device_t dev)
 	if_setsendqready(ifp);
 #endif
 
+	if_setcapabilities(ifp, IFCAP_JUMBO_MTU | IFCAP_VLAN_MTU
+	    | IFCAP_TXCSUM | IFCAP_TXCSUM_IPV6
+	    | IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6);
 	if_setcapenable(ifp, if_getcapabilities(ifp));
+	if_sethwassist(ifp, CSUM_IP | CSUM_IP_TCP | CSUM_IP_UDP |
+	    CSUM_IP6_TCP | CSUM_IP6_UDP);
 
-	/* Attach PHY(s) */
-	error = mii_attach(sc->sc_dev, &sc->sc_mii_dev, ifp, dtsec_ifmedia_upd,
-	    dtsec_ifmedia_sts, BMSR_DEFCAPMASK, sc->sc_phy_addr,
-	    MII_OFFSET_ANY, 0);
-	if (error) {
-		device_printf(sc->sc_dev, "attaching PHYs failed: %d\n", error);
-		dtsec_detach(sc->sc_dev);
-		return (error);
+	/* Attach PHY(s) — skip for 10G ports with no external PHY
+	 * (SFP+ uses in-band status, sc_phy_addr set to -1). */
+	if (sc->sc_phy_addr >= 0) {
+		error = mii_attach(sc->sc_dev, &sc->sc_mii_dev, ifp,
+		    dtsec_ifmedia_upd, dtsec_ifmedia_sts, BMSR_DEFCAPMASK,
+		    sc->sc_phy_addr, MII_OFFSET_ANY, 0);
+		if (error) {
+			if_printf(sc->sc_ifnet, "attaching PHYs failed: "
+			    "%d\n", error);
+			dtsec_detach(sc->sc_dev);
+			return (error);
+		}
+		sc->sc_mii = device_get_softc(sc->sc_mii_dev);
 	}
-	sc->sc_mii = device_get_softc(sc->sc_mii_dev);
 
 	/* Attach to stack */
 	ether_ifattach(ifp, sc->sc_mac_addr);
+
+	/* Set baudrate */
+	if (sc->sc_eth_dev_type == ETH_10GSEC)
+		if_setbaudrate(ifp, IF_Gbps(10ULL));
+	else
+		if_setbaudrate(ifp, IF_Gbps(1ULL));
+
+	/* 10G SFP+ direct-attach: link is always up (no PHY) */
+	if (sc->sc_phy_addr < 0)
+		if_link_state_change(ifp, LINK_STATE_UP);
+
+	/* Add diagnostic sysctls */
+	if (sc->sc_mode == DTSEC_MODE_REGULAR) {
+		struct sysctl_ctx_list *ctx;
+		struct sysctl_oid *tree;
+
+		ctx = device_get_sysctl_ctx(dev);
+		tree = device_get_sysctl_tree(dev);
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "bman_free", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, dtsec_sysctl_bman_free, "IU",
+		    "BMan free buffer count");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "diag", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, dtsec_sysctl_diag, "I",
+		    "Write 1 to dump DQRR + BMan state to dmesg");
+	}
 
 	return (0);
 }
@@ -740,6 +1031,9 @@ dtsec_detach(device_t dev)
 	}
 
 	if (sc->sc_mode == DTSEC_MODE_REGULAR) {
+		/* Free PCD (must happen before port free) */
+		dtsec_rm_pcd_free(sc);
+
 		/* Free RX/TX FQRs */
 		dtsec_rm_fqr_rx_free(sc);
 		dtsec_rm_fqr_tx_free(sc);
@@ -820,6 +1114,9 @@ dtsec_miibus_statchg(device_t dev)
 
 	DTSEC_LOCK_ASSERT(sc);
 
+	if (sc->sc_mii == NULL)
+		return;		/* 10G port, no PHY — nothing to adjust */
+
 	duplex = ((sc->sc_mii->mii_media_active & IFM_GMASK) == IFM_FDX);
 
 	switch (IFM_SUBTYPE(sc->sc_mii->mii_media_active)) {
@@ -842,6 +1139,6 @@ dtsec_miibus_statchg(device_t dev)
 
 	error = FM_MAC_AdjustLink(sc->sc_mach, speed, duplex);
 	if (error != E_OK)
-		device_printf(sc->sc_dev, "error while adjusting MAC speed.\n");
+		if_printf(sc->sc_ifnet, "error while adjusting MAC speed.\n");
 }
 /** @} */

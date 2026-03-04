@@ -34,7 +34,7 @@
 int	dtsec_rm_fm_port_rx_init(struct dtsec_softc *sc, int unit);
 int	dtsec_rm_fm_port_tx_init(struct dtsec_softc *sc, int unit);
 
-void	dtsec_rm_if_start_locked(struct dtsec_softc *sc);
+int	dtsec_rm_if_transmit(if_t ifp, struct mbuf *m);
 
 int	dtsec_rm_pool_rx_init(struct dtsec_softc *sc);
 void	dtsec_rm_pool_rx_free(struct dtsec_softc *sc);
@@ -46,6 +46,10 @@ int	dtsec_rm_fqr_rx_init(struct dtsec_softc *sc);
 int	dtsec_rm_fqr_tx_init(struct dtsec_softc *sc);
 void	dtsec_rm_fqr_rx_free(struct dtsec_softc *sc);
 void	dtsec_rm_fqr_tx_free(struct dtsec_softc *sc);
+void	dtsec_release_rss_fqrs(void);
+
+int	dtsec_rm_pcd_init(struct dtsec_softc *sc);
+void	dtsec_rm_pcd_free(struct dtsec_softc *sc);
 /** @} */
 
 #endif /* IF_DTSEC_RM_H_ */

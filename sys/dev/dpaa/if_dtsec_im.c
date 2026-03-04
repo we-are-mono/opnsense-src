@@ -229,7 +229,8 @@ dtsec_im_if_start_locked(struct dtsec_softc *sc)
 	DTSEC_LOCK_ASSERT(sc);
 	/* TODO: IFF_DRV_OACTIVE */
 
-	if ((sc->sc_mii->mii_media_status & IFM_ACTIVE) == 0)
+	if (sc->sc_mii != NULL &&
+	    (sc->sc_mii->mii_media_status & IFM_ACTIVE) == 0)
 		return;
 
 	if ((if_getdrvflags(sc->sc_ifnet) & IFF_DRV_RUNNING) != IFF_DRV_RUNNING)
