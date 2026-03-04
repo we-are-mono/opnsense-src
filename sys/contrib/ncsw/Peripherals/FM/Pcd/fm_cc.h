@@ -348,6 +348,11 @@ typedef struct
     uint32_t            shadowAction;
     uint8_t             userSizeOfExtraction;
     uint8_t             userOffset;
+
+#if (DPAA_VERSION >= 11)
+    bool                externalHash;           /* CDX external hash table */
+#endif /* (DPAA_VERSION >= 11) */
+
     uint8_t             kgHashShift;            /* used in hash-table */
 
     t_Handle            h_Spinlock;

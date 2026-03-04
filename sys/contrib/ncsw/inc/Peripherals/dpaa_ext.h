@@ -182,29 +182,42 @@ typedef _Packed struct t_DpaaCompTbl {
 #define DPAA_SGTE_BPID_MASK     0x00ff0000           /**< SGTE BPID field mask */
 #define DPAA_SGTE_OFFSET_MASK   0x00001fff           /**< SGTE OFFSET field mask */
 
-#define DPAA_SGTE_GET_ADDRH(sgte)         (((t_DpaaSGTE *)sgte)->addrh & DPAA_SGTE_ADDRH_MASK)              /**< Macro to get SGTE ADDRH field */
-#define DPAA_SGTE_GET_ADDRL(sgte)         ((t_DpaaSGTE *)sgte)->addrl                                       /**< Macro to get SGTE ADDRL field */
-#define DPAA_SGTE_GET_PHYS_ADDR(sgte)     ((physAddress_t)(((uint64_t)DPAA_SGTE_GET_ADDRH(sgte) << 32) | (uint64_t)DPAA_SGTE_GET_ADDRL(sgte))) /**< Macro to get FD ADDR field */
-#define DPAA_SGTE_GET_EXTENSION(sgte)     ((((t_DpaaSGTE *)sgte)->length & DPAA_SGTE_E_MASK) >> (31-0))     /**< Macro to get SGTE EXTENSION field */
-#define DPAA_SGTE_GET_FINAL(sgte)         ((((t_DpaaSGTE *)sgte)->length & DPAA_SGTE_F_MASK) >> (31-1))     /**< Macro to get SGTE FINAL field */
-#define DPAA_SGTE_GET_LENGTH(sgte)        (((t_DpaaSGTE *)sgte)->length & DPAA_SGTE_LENGTH_MASK)            /**< Macro to get SGTE LENGTH field */
-#define DPAA_SGTE_GET_BPID(sgte)          ((((t_DpaaSGTE *)sgte)->offset & DPAA_SGTE_BPID_MASK) >> (31-15)) /**< Macro to get SGTE BPID field */
-#define DPAA_SGTE_GET_OFFSET(sgte)        (((t_DpaaSGTE *)sgte)->offset & DPAA_SGTE_OFFSET_MASK)            /**< Macro to get SGTE OFFSET field */
+/*
+ * SGT entries live in host DMA memory and are read/written by FMan in
+ * big-endian byte order.  On big-endian hosts (PowerPC) no swap is needed.
+ * On little-endian hosts (ARM64) each 32-bit field must be byte-swapped.
+ */
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define _DPAA_SGTE_R32(field)           (field)
+#define _DPAA_SGTE_W32(field, val)      ((field) = (val))
+#else
+#define _DPAA_SGTE_R32(field)           __builtin_bswap32(field)
+#define _DPAA_SGTE_W32(field, val)      ((field) = __builtin_bswap32(val))
+#endif
+
+#define DPAA_SGTE_GET_ADDRH(sgte)         (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->addrh) & DPAA_SGTE_ADDRH_MASK)
+#define DPAA_SGTE_GET_ADDRL(sgte)         _DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->addrl)
+#define DPAA_SGTE_GET_PHYS_ADDR(sgte)     ((physAddress_t)(((uint64_t)DPAA_SGTE_GET_ADDRH(sgte) << 32) | (uint64_t)DPAA_SGTE_GET_ADDRL(sgte)))
+#define DPAA_SGTE_GET_EXTENSION(sgte)     ((_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->length) & DPAA_SGTE_E_MASK) >> (31-0))
+#define DPAA_SGTE_GET_FINAL(sgte)         ((_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->length) & DPAA_SGTE_F_MASK) >> (31-1))
+#define DPAA_SGTE_GET_LENGTH(sgte)        (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->length) & DPAA_SGTE_LENGTH_MASK)
+#define DPAA_SGTE_GET_BPID(sgte)          ((_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->offset) & DPAA_SGTE_BPID_MASK) >> (31-15))
+#define DPAA_SGTE_GET_OFFSET(sgte)        (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->offset) & DPAA_SGTE_OFFSET_MASK)
 #define DPAA_SGTE_GET_ADDR(sgte)          XX_PhysToVirt(DPAA_SGTE_GET_PHYS_ADDR(sgte))
 
-#define DPAA_SGTE_SET_ADDRH(sgte,val)     (((t_DpaaSGTE *)sgte)->addrh = ((((t_DpaaSGTE *)sgte)->addrh & ~DPAA_SGTE_ADDRH_MASK) | ((val) & DPAA_SGTE_ADDRH_MASK))) /**< Macro to set SGTE ADDRH field */
-#define DPAA_SGTE_SET_ADDRL(sgte,val)     ((t_DpaaSGTE *)sgte)->addrl = (val)                                 /**< Macro to set SGTE ADDRL field */
+#define DPAA_SGTE_SET_ADDRH(sgte,val)     _DPAA_SGTE_W32(((t_DpaaSGTE *)sgte)->addrh, (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->addrh) & ~DPAA_SGTE_ADDRH_MASK) | ((val) & DPAA_SGTE_ADDRH_MASK))
+#define DPAA_SGTE_SET_ADDRL(sgte,val)     _DPAA_SGTE_W32(((t_DpaaSGTE *)sgte)->addrl, (val))
 #define DPAA_SGTE_SET_ADDR(sgte,val)                            \
 do {                                                            \
     uint64_t physAddr = (uint64_t)(XX_VirtToPhys(val));         \
     DPAA_SGTE_SET_ADDRH(sgte, ((uint32_t)(physAddr >> 32)));    \
     DPAA_SGTE_SET_ADDRL(sgte, (uint32_t)physAddr);              \
-} while (0)                                                                                                 /**< Macro to set SGTE ADDR field */
-#define DPAA_SGTE_SET_EXTENSION(sgte,val) (((t_DpaaSGTE *)sgte)->length = ((((t_DpaaSGTE *)sgte)->length & ~DPAA_SGTE_E_MASK) | (((val)  << (31-0))& DPAA_SGTE_E_MASK)))            /**< Macro to set SGTE EXTENSION field */
-#define DPAA_SGTE_SET_FINAL(sgte,val)     (((t_DpaaSGTE *)sgte)->length = ((((t_DpaaSGTE *)sgte)->length & ~DPAA_SGTE_F_MASK) | (((val)  << (31-1))& DPAA_SGTE_F_MASK)))            /**< Macro to set SGTE FINAL field */
-#define DPAA_SGTE_SET_LENGTH(sgte,val)    (((t_DpaaSGTE *)sgte)->length = (((t_DpaaSGTE *)sgte)->length & ~DPAA_SGTE_LENGTH_MASK) | ((val) & DPAA_SGTE_LENGTH_MASK))                /**< Macro to set SGTE LENGTH field */
-#define DPAA_SGTE_SET_BPID(sgte,val)      (((t_DpaaSGTE *)sgte)->offset = ((((t_DpaaSGTE *)sgte)->offset & ~DPAA_SGTE_BPID_MASK) | (((val)  << (31-15))& DPAA_SGTE_BPID_MASK)))     /**< Macro to set SGTE BPID field */
-#define DPAA_SGTE_SET_OFFSET(sgte,val)    (((t_DpaaSGTE *)sgte)->offset = ((((t_DpaaSGTE *)sgte)->offset & ~DPAA_SGTE_OFFSET_MASK) | (((val) << (31-31))& DPAA_SGTE_OFFSET_MASK) )) /**< Macro to set SGTE OFFSET field */
+} while (0)
+#define DPAA_SGTE_SET_EXTENSION(sgte,val) _DPAA_SGTE_W32(((t_DpaaSGTE *)sgte)->length, (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->length) & ~DPAA_SGTE_E_MASK) | (((val) << (31-0)) & DPAA_SGTE_E_MASK))
+#define DPAA_SGTE_SET_FINAL(sgte,val)     _DPAA_SGTE_W32(((t_DpaaSGTE *)sgte)->length, (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->length) & ~DPAA_SGTE_F_MASK) | (((val) << (31-1)) & DPAA_SGTE_F_MASK))
+#define DPAA_SGTE_SET_LENGTH(sgte,val)    _DPAA_SGTE_W32(((t_DpaaSGTE *)sgte)->length, (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->length) & ~DPAA_SGTE_LENGTH_MASK) | ((val) & DPAA_SGTE_LENGTH_MASK))
+#define DPAA_SGTE_SET_BPID(sgte,val)      _DPAA_SGTE_W32(((t_DpaaSGTE *)sgte)->offset, (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->offset) & ~DPAA_SGTE_BPID_MASK) | (((val) << (31-15)) & DPAA_SGTE_BPID_MASK))
+#define DPAA_SGTE_SET_OFFSET(sgte,val)    _DPAA_SGTE_W32(((t_DpaaSGTE *)sgte)->offset, (_DPAA_SGTE_R32(((t_DpaaSGTE *)sgte)->offset) & ~DPAA_SGTE_OFFSET_MASK) | (((val) << (31-31)) & DPAA_SGTE_OFFSET_MASK))
 /* @} */
 
 #if defined(__MWERKS__) && !defined(__GNUC__)

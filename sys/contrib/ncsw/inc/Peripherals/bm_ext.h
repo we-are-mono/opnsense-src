@@ -131,6 +131,9 @@ typedef struct {
                                                          NOTE: this parameter relevant only when working with multiple partitions. */
     uint8_t                 partNumOfPools;         /**< Number of Pools dedicated to this partition.
                                                          NOTE: this parameter relevant only when working with multiple partitions. */
+    void                    *p_FbprBase;            /**< Pre-allocated FBPR memory (virtual), or NULL for internal allocation.
+                                                         Must be physically contiguous, naturally aligned, and non-cacheable. */
+    uint32_t                fbprSize;               /**< Size of pre-allocated FBPR memory in bytes. */
 } t_BmParam;
 
 

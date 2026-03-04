@@ -158,6 +158,14 @@ static t_Error SetProfileNia(t_FmPcd *p_FmPcd, e_FmPcdEngine nextEngine, u_FmPcd
                 RETURN_ERROR(MAJOR, E_INVALID_STATE, ("Invalid profile "));
             nia |= NIA_ENG_PLCR | NIA_PLCR_ABSOLUTE | absoluteProfileId;
             break;
+        case e_FM_PCD_PRS:
+            /* Post-policer: re-enter PCD pipeline via KG engine */
+            nia |= 0x00480200;
+            break;
+        case e_FM_PCD_CC:
+            /* Post-policer: coarse classifier engine */
+            nia |= 0x26;
+            break;
         default:
             RETURN_ERROR(MAJOR, E_INVALID_SELECTION, NO_MSG);
     }

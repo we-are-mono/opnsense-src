@@ -61,6 +61,7 @@ static void depletion_link(t_BmPool *p_BmPool)
 
     NCSW_PLOCK(p_Portal);
     p_Portal->depletionPoolsTable[p_BmPool->bpid] = p_BmPool;
+    bman_depletion_set(&p_Portal->pools[0], (uint8_t)p_BmPool->bpid);
     bm_isr_bscn_mask(p_Portal->p_BmPortalLow, (uint8_t)p_BmPool->bpid, 1);
     PUNLOCK(p_Portal);
 }
@@ -71,6 +72,7 @@ static void depletion_unlink(t_BmPool *p_BmPool)
 
     NCSW_PLOCK(p_Portal);
     p_Portal->depletionPoolsTable[p_BmPool->bpid] = NULL;
+    bman_depletion_unset(&p_Portal->pools[0], (uint8_t)p_BmPool->bpid);
     bm_isr_bscn_mask(p_Portal->p_BmPortalLow, (uint8_t)p_BmPool->bpid, 0);
     PUNLOCK(p_Portal);
 }
