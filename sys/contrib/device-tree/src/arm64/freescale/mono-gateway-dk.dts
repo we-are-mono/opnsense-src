@@ -442,6 +442,35 @@
 	reg = <0 0xc3000000 0 0x800000>;	/* 8MB at 0xC3000000 */
 };
 
+/*
+ * Board mux/enable GPIOs — configure for 2R (dual-radio / Jody W337).
+ * 2R-enable: power/mux enable for the PCIe WiFi card
+ * 3R-enable: disabled (3R = 3-radio card, no PCIe)
+ * uart-mux: route shared UART to 2R card
+ */
+&gpio2 {
+	2r-enable {
+		gpio-hog;
+		gpios = <6 GPIO_ACTIVE_LOW>;
+		output-high;
+		line-name = "2r-enable";
+	};
+
+	3r-enable {
+		gpio-hog;
+		gpios = <2 GPIO_ACTIVE_LOW>;
+		output-low;
+		line-name = "3r-enable";
+	};
+
+	uart-mux {
+		gpio-hog;
+		gpios = <26 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "uart-mux";
+	};
+};
+
 /* PCIe3: Jody W337 WiFi module (NXP 88W9098) */
 &pcie3 {
 	status = "okay";

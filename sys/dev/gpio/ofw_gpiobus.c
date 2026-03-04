@@ -430,6 +430,7 @@ ofw_gpiobus_attach(device_t dev)
 	bus_enumerate_hinted_children(dev);
 	/*
 	 * Attach the children represented in the device tree.
+	 * gpio-hog nodes are already processed by gpiobus_attach_bus().
 	 */
 	for (child = OF_child(ofw_bus_get_node(dev)); child != 0;
 	    child = OF_peer(child)) {
