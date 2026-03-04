@@ -103,7 +103,10 @@ static driver_t qm_portals_driver = {
 };
 
 EARLY_DRIVER_MODULE(qman_portals, ofwbus, qm_portals_driver, 0, 0,
-    BUS_PASS_BUS);
+    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_LAST);
+/* On ARM64, portal bus nodes are children of soc (simplebus), not ofwbus */
+EARLY_DRIVER_MODULE(qman_portals, simplebus, qm_portals_driver, 0, 0,
+    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_LAST);
 
 static void
 get_addr_props(phandle_t node, uint32_t *addrp, uint32_t *sizep)
@@ -147,7 +150,7 @@ qman_portal_find_cpu(int cpu)
 		return (-1);
 
 	for (node = OF_child(node); node != 0; node = OF_peer(node)) {
-		if (OF_getprop(node, "reg", &reg, sizeof(reg)) <= 0)
+		if (OF_getencprop(node, "reg", &reg, sizeof(reg)) <= 0)
 			continue;
 		if (reg == cpu)
 			return (node);
@@ -212,14 +215,16 @@ qman_portals_fdt_attach(device_t dev)
 			continue;
 		}
 		/* Checkout related cpu */
-		if (OF_getprop(child, "cpu-handle", (void *)&cpu,
+		if (OF_getencprop(child, "cpu-handle", (void *)&cpu,
 		    sizeof(cpu)) <= 0) {
-			cpu = qman_portal_find_cpu(cpus);
-			if (cpu <= 0)
+			/* No cpu-handle (ARM64): find CPU node directly */
+			cpu_node = qman_portal_find_cpu(cpus);
+			if (cpu_node <= 0)
 				continue;
+		} else {
+			/* cpu-handle is an ihandle (PowerPC) */
+			cpu_node = OF_instance_to_package(cpu);
 		}
-		/* Acquire cpu number */
-		cpu_node = OF_instance_to_package(cpu);
 		if (OF_getencprop(cpu_node, "reg", &cpu_num, sizeof(cpu_num)) <= 0) {
 			device_printf(dev, "Could not retrieve CPU number.\n");
 			return (ENXIO);
