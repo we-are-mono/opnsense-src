@@ -286,6 +286,26 @@ qman_portal_poll_task(void *arg, int pending)
 }
 
 /*
+ * qman_portal_quiesce — Drain all per-CPU portal poll taskqueues.
+ *
+ * Waits for any in-flight QM_PORTAL_Poll() call to complete on every
+ * CPU.  Must be called after retiring FQRs to ensure no portal poll
+ * task references a stale DQRR callback from a module about to be
+ * unloaded.
+ */
+void
+qman_portal_quiesce(void)
+{
+	int cpu;
+
+	for (cpu = 0; cpu < mp_ncpus; cpu++) {
+		if (qman_napi[cpu].tq != NULL)
+			taskqueue_drain(qman_napi[cpu].tq,
+			    &qman_napi[cpu].task);
+	}
+}
+
+/*
  * Initialize a QMan portal for a specific CPU with NAPI-style
  * interrupt handling.  Like Linux's qman_create_affine_portal +
  * dpaa_eth_add_channel:
