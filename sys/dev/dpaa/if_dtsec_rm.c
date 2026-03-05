@@ -663,6 +663,30 @@ dtsec_rm_buf_free_external(uint8_t bpid, void *buf)
 	    (void *)(*(uintptr_t *)buf));	/* recover stashed KVA */
 	atomic_subtract_32(&sc->sc_rx_buf_total, 1);
 }
+
+void
+dtsec_rm_pool_rx_refill_bpid(uint8_t bpid)
+{
+	struct dtsec_softc *sc;
+	uint32_t total;
+	unsigned int n, added;
+
+	sc = dtsec_bpid_map[bpid];
+	if (__predict_false(sc == NULL))
+		return;
+
+	if (__predict_false(bman_count(sc->sc_rx_pool) <
+	    DTSEC_RM_POOL_RX_REFILL_THRESH) &&
+	    atomic_load_32(&sc->sc_rx_buf_total) <
+	    DTSEC_RM_POOL_RX_MAX_TOTAL) {
+		total = atomic_load_32(&sc->sc_rx_buf_total);
+		n = DTSEC_RM_POOL_RX_REFILL_COUNT;
+		if (n > DTSEC_RM_POOL_RX_MAX_TOTAL - total)
+			n = DTSEC_RM_POOL_RX_MAX_TOTAL - total;
+		added = dtsec_rm_pool_rx_refill(sc, n);
+		atomic_add_32(&sc->sc_rx_buf_total, added);
+	}
+}
 /** @} */
 
 

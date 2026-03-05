@@ -280,6 +280,7 @@ uint32_t qman_get_sfdr_in_use(void);
 t_Handle qman_portal_init_cpu(struct qman_softc *, int);
 void qman_portal_dqrr_diag(void);
 void qman_ccsr_diag(void);
+void qman_portal_quiesce(void);
 struct mbuf;
 void qman_rx_defer(struct mbuf *);
 #endif
