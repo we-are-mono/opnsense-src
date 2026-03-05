@@ -437,6 +437,77 @@ dpaa_oh_detach(device_t dev)
 
 
 /**
+ * @group Distribution FQ callback registry.
+ *
+ * BPID-keyed table for OH port consumers to register distribution FQ
+ * handlers.  CDX calls dpaa_oh_lookup_dist_cb() in its distribution
+ * FQ callback to dispatch frames to the appropriate consumer.
+ * @{
+ */
+#define	DPAA_OH_MAX_DIST_CBS	4
+
+static struct {
+	uint8_t		bpid;
+	bool		active;
+	dpaa_oh_dist_cb_t fn;
+	t_Handle	app;
+} dpaa_oh_dist_cbs[DPAA_OH_MAX_DIST_CBS];
+
+int
+dpaa_oh_register_dist_cb(uint8_t bpid, dpaa_oh_dist_cb_t fn, t_Handle app)
+{
+	int i;
+
+	for (i = 0; i < DPAA_OH_MAX_DIST_CBS; i++) {
+		if (!dpaa_oh_dist_cbs[i].active) {
+			dpaa_oh_dist_cbs[i].bpid = bpid;
+			dpaa_oh_dist_cbs[i].fn = fn;
+			dpaa_oh_dist_cbs[i].app = app;
+			atomic_thread_fence_rel();
+			dpaa_oh_dist_cbs[i].active = true;
+			printf("dpaa_oh: dist cb registered for bpid %u\n",
+			    bpid);
+			return (0);
+		}
+	}
+	return (ENOSPC);
+}
+
+void
+dpaa_oh_unregister_dist_cb(uint8_t bpid)
+{
+	int i;
+
+	for (i = 0; i < DPAA_OH_MAX_DIST_CBS; i++) {
+		if (dpaa_oh_dist_cbs[i].active &&
+		    dpaa_oh_dist_cbs[i].bpid == bpid) {
+			dpaa_oh_dist_cbs[i].active = false;
+			atomic_thread_fence_rel();
+			printf("dpaa_oh: dist cb unregistered for bpid %u\n",
+			    bpid);
+			return;
+		}
+	}
+}
+
+dpaa_oh_dist_cb_t
+dpaa_oh_lookup_dist_cb(uint8_t bpid, t_Handle *app)
+{
+	int i;
+
+	for (i = 0; i < DPAA_OH_MAX_DIST_CBS; i++) {
+		if (dpaa_oh_dist_cbs[i].active &&
+		    dpaa_oh_dist_cbs[i].bpid == bpid) {
+			*app = dpaa_oh_dist_cbs[i].app;
+			return (dpaa_oh_dist_cbs[i].fn);
+		}
+	}
+	return (NULL);
+}
+/** @} */
+
+
+/**
  * @group Public API.
  * @{
  */
@@ -563,4 +634,5 @@ static driver_t dpaa_oh_driver = {
 };
 
 DRIVER_MODULE(dpaa_oh, fman, dpaa_oh_driver, 0, 0);
+MODULE_VERSION(dpaa_oh, 1);
 /** @} */

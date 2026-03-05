@@ -592,10 +592,10 @@ ExternalHashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
 			t_FmPcdCcNextKgParams *kgparams =
 			    &p_Param->ccNextEngineParamsForMiss.params.kgParams;
 
-			node->word_2 = NIA_ENG_KG | NIA_KG_DIRECT;
+			node->word_2 = NIA_ENG_KG | NIA_KG_DIRECT |
+			    NIA_KG_CC_EN;
 			if (kgparams->overrideFqid)
-				node->word_2 |= kgparams->newFqid |
-				    NIA_KG_CC_EN;
+				node->word_2 |= kgparams->newFqid;
 			node->word_2 |=
 			    FmPcdKgGetSchemeId(kgparams->h_DirectScheme);
 			miss_action = EN_EHASH_MISS_ACTION_NIA;
@@ -973,22 +973,31 @@ ExternalHashTableEntryGetStatsAndTS(void *tbl_entry,
 /*
  * ExternalHashTableModifyMissNextEngine — Change the miss action.
  *
- * Modifies the MURAM AD node directly (via info->h_Ad, set by
- * copy_td_to_ccbase).  ALL 4 words of the AD must be written in
- * a single batch — partial writes corrupt the unwritten words
- * (LS1046A MURAM / Normal-NC ARM64 store behavior).
+ * Matches Linux NXP SDK fm_ehash.c:1090-1181 with ARM64 MURAM
+ * write adaptations:
  *
- * Uses info->node as the base (unchanged table_base_lo, word_1)
- * and modifies word_0 (miss action) and word_2 (FQID/NIA).
- * Also updates info->node so it stays in sync for future calls.
+ * 1. Re-read current AD from MURAM (not cached info->node) — the
+ *    CDX microcode or NCSW PCD setup may have modified the AD
+ *    since copy_td_to_ccbase() wrote it.
+ *
+ * 2. Two-phase write: set miss action to DROP first, then update
+ *    word_2 (NIA/FQID) and word_0 (real miss action).  Prevents
+ *    microcode from seeing a partially-updated AD.
+ *
+ * 3. All 4 words written in batch — partial writes corrupt
+ *    unwritten words (LS1046A MURAM / Normal-NC ARM64 behavior).
+ *
+ * 4. KG always sets NIA_KG_CC_EN (Linux fm_ehash.c:1115).
+ *
+ * 5. PLCR uses newRelativeProfileId directly (Linux fm_ehash.c:1151).
  */
 t_Error
 ExternalHashTableModifyMissNextEngine(t_Handle h_HashTbl,
     t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
 {
 	struct en_exthash_info *info;
-	volatile uint32_t *p;
-	struct en_exthash_node *ptr;
+	struct en_exthash_node *ad;
+	uint32_t w0, w3;
 
 	info = (struct en_exthash_info *)h_HashTbl;
 	if (info->h_Ad == NULL) {
@@ -997,111 +1006,82 @@ ExternalHashTableModifyMissNextEngine(t_Handle h_HashTbl,
 		return (E_INVALID_STATE);
 	}
 
-	ptr = &info->node;
+	ad = (struct en_exthash_node *)info->h_Ad;
 
 	/*
-	 * Enhanced hash AD miss action patching.
-	 *
-	 * Modify word_0 (miss_action bits [31:30]) and word_2 (FQID/NIA)
-	 * while preserving table_base_lo and word_1 (hash table params).
-	 *
-	 * Build #208: reverted from standard Result AD format which the
-	 * CDX microcode cannot interpret (build #207 showed all frames
-	 * discarded with QMan Invalid Enqueue State for KG baseFqid).
+	 * Read current word_0 and word_2 from MURAM.
+	 * Match Linux fm_ehash.c:1097-1098.
 	 */
-	{
-		uint32_t fqid = 0;
+	w0 = GET_UINT32(ad->word_0);
+	w3 = GET_UINT32(ad->word_2);
 
-		switch (p_FmPcdCcNextEngineParams->nextEngine) {
-		case e_FM_PCD_DONE: {
-			t_FmPcdCcNextEnqueueParams *enqparams =
-			    &p_FmPcdCcNextEngineParams->params.enqueueParams;
-			if (enqparams->overrideFqid)
-				fqid = enqparams->newFqid & 0x00FFFFFF;
+	/*
+	 * Phase 1: Set miss action to DROP while we update.
+	 * Match Linux fm_ehash.c:1100-1102.
+	 * Write ONLY word_0 — do NOT touch other words.
+	 */
+	WRITE_UINT32(ad->word_0, (w0 & ~EHASH_W0_MISS_ACTION_MASK) |
+	    EHASH_W0_MISS_ACTION(EN_EHASH_MISS_ACTION_DROP));
 
-			/* Set miss_action to ENQUE, preserve other word_0 fields */
-			ptr->word_0 = (ptr->word_0 & ~EHASH_W0_MISS_ACTION_MASK) |
+	/*
+	 * Phase 2: Build new miss action.
+	 * Match Linux fm_ehash.c:1105-1164.
+	 */
+	switch (p_FmPcdCcNextEngineParams->nextEngine) {
+	case e_FM_PCD_KG: {
+		t_FmPcdCcNextKgParams *kgparams =
+		    &p_FmPcdCcNextEngineParams->params.kgParams;
+
+		w3 = NIA_ENG_KG | NIA_KG_DIRECT | NIA_KG_CC_EN;
+		w3 |= FmPcdKgGetSchemeId(kgparams->h_DirectScheme);
+		w0 = (w0 & ~EHASH_W0_MISS_ACTION_MASK) |
+		    EHASH_W0_MISS_ACTION(EN_EHASH_MISS_ACTION_NIA);
+		break;
+	}
+	case e_FM_PCD_PLCR: {
+		t_FmPcdCcNextPlcrParams *plcrparams =
+		    &p_FmPcdCcNextEngineParams->params.plcrParams;
+
+		if (plcrparams->sharedProfile)
+			w3 = NIA_ENG_PLCR | NIA_PLCR_ABSOLUTE |
+			    plcrparams->newRelativeProfileId;
+		else
+			w3 = NIA_ENG_PLCR |
+			    plcrparams->newRelativeProfileId;
+		w0 = (w0 & ~EHASH_W0_MISS_ACTION_MASK) |
+		    EHASH_W0_MISS_ACTION(EN_EHASH_MISS_ACTION_NIA);
+		break;
+	}
+	case e_FM_PCD_DONE: {
+		t_FmPcdCcNextEnqueueParams *enqparams =
+		    &p_FmPcdCcNextEngineParams->params.enqueueParams;
+
+		if (enqparams->overrideFqid) {
+			w3 = enqparams->newFqid;
+			w0 = (w0 & ~EHASH_W0_MISS_ACTION_MASK) |
 			    EHASH_W0_MISS_ACTION(EN_EHASH_MISS_ACTION_ENQUE);
-			ptr->word_2 = fqid;
-			break;
+		} else {
+			w0 = (w0 & ~EHASH_W0_MISS_ACTION_MASK) |
+			    EHASH_W0_MISS_ACTION(EN_EHASH_MISS_ACTION_DONE);
 		}
-		default:
-			printf("fm_ehash: ModifyMiss: unhandled engine %d\n",
-			    p_FmPcdCcNextEngineParams->nextEngine);
-			break;
-		}
-
+		break;
+	}
+	default:
+		printf("fm_ehash: ModifyMiss: unhandled engine %d\n",
+		    p_FmPcdCcNextEngineParams->nextEngine);
+		w0 = (w0 & ~EHASH_W0_MISS_ACTION_MASK) |
+		    EHASH_W0_MISS_ACTION(EN_EHASH_MISS_ACTION_DROP);
+		break;
 	}
 
 	/*
-	 * Write the 16-byte AD to MURAM.
-	 * Verify + retry in case of CCI-400/AXI flush timing.
+	 * Phase 3: Write ONLY word_2 then word_0 to MURAM.
+	 * Match Linux fm_ehash.c:1166-1167 exactly.
+	 * Use WRITE_UINT32 (NCSW macro = out32rb + dsb per store).
+	 * Do NOT touch table_base_lo or word_1.
 	 */
-	p = (volatile uint32_t *)info->h_Ad;
-	{
-		uint32_t v0, v1, v2, v3;
-		int retry;
-
-		for (retry = 0; retry < 4; retry++) {
-			muram_wr32(&p[2], ptr->word_1);        /* offset 8  */
-			muram_wr32(&p[1], ptr->table_base_lo); /* offset 4  */
-			muram_wr32(&p[3], ptr->word_2);        /* offset 12 */
-			muram_wr32(&p[0], ptr->word_0);        /* offset 0  */
-			muram_barrier();
-
-			v0 = muram_rd32(&p[0]);
-			v1 = muram_rd32(&p[1]);
-			v2 = muram_rd32(&p[2]);
-			v3 = muram_rd32(&p[3]);
-			if (v0 == ptr->word_0 &&
-			    v1 == ptr->table_base_lo &&
-			    v2 == ptr->word_1 &&
-			    v3 == ptr->word_2)
-				break;
-
-			printf("fm_ehash: ModifyMiss AD=%p attempt %d "
-			    "VERIFY FAIL [%08x %08x %08x %08x] != "
-			    "[%08x %08x %08x %08x]\n",
-			    info->h_Ad, retry + 1,
-			    v0, v1, v2, v3,
-			    ptr->word_0, ptr->table_base_lo,
-			    ptr->word_1, ptr->word_2);
-		}
-	}
-
-	/*
-	 * Propagate miss action to CC tree copy entries.
-	 *
-	 * The CC tree fill logic (fm_cc.c CcRootBuild) copies entry 0
-	 * to unused slots (indices numOfEntries..15) via raw memcpy.
-	 * These copies have the pre-ModifyMiss state because
-	 * copy_td_to_ccbase only tracks a single h_Ad per hash table.
-	 *
-	 * Scan all 16 CC tree entries: any entry (other than h_Ad
-	 * itself) that is a copy and needs its miss action updated.
-	 *
-	 * CC tree is 256-byte aligned (FM_PCD_CC_TREE_ADDR_ALIGN).
-	 */
-	{
-		uintptr_t tree_base =
-		    (uintptr_t)info->h_Ad & ~(uintptr_t)0xFF;
-		int j;
-
-		for (j = 0; j < FM_PCD_MAX_NUM_OF_CC_GROUPS; j++) {
-			volatile uint32_t *ep = (volatile uint32_t *)
-			    (tree_base + j * FM_PCD_CC_AD_ENTRY_SIZE);
-			if (ep == (volatile uint32_t *)info->h_Ad)
-				continue;  /* skip the entry we just wrote */
-			if (muram_rd32(&ep[1]) == ptr->table_base_lo) {
-				/* Copy with same table — update all 4 words */
-				muram_wr32(&ep[2], ptr->word_1);
-				muram_wr32(&ep[1], ptr->table_base_lo);
-				muram_wr32(&ep[3], ptr->word_2);
-				muram_wr32(&ep[0], ptr->word_0);
-				muram_barrier();
-			}
-		}
-	}
+	WRITE_UINT32(ad->word_2, w3);
+	WRITE_UINT32(ad->word_0, w0);
 
 	return (E_OK);
 }
