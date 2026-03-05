@@ -29,6 +29,8 @@
 
 #include <contrib/ncsw/inc/ncsw_ext.h>
 #include <contrib/ncsw/inc/integrations/dpaa_integration_ext.h>
+#include <contrib/ncsw/inc/Peripherals/dpaa_ext.h>
+#include <contrib/ncsw/inc/Peripherals/qm_ext.h>
 
 /**
  * Find an OH port device by its cell-index (hardware port ID).
@@ -86,5 +88,30 @@ int		dpaa_oh_enqueue(device_t dev, t_DpaaFD *fd);
  */
 int		dpaa_oh_register_cb(device_t dev,
 		    t_QmReceivedFrameCallback *callback, t_Handle app);
+
+/**
+ * Distribution FQ callback type.
+ * Same signature as t_QmReceivedFrameCallback.
+ */
+typedef e_RxStoreResponse (*dpaa_oh_dist_cb_t)(t_Handle app,
+    t_Handle fqr, t_Handle portal, uint32_t fqid_off, t_DpaaFD *fd);
+
+/**
+ * Register a distribution FQ callback keyed by BMan pool ID.
+ *
+ * When CDX takes over PCD, frames matching KeyGen distribution
+ * schemes on OH ports arrive at CDX distribution FQs.  OH port
+ * consumers (WiFi, IPsec) register here so CDX can dispatch
+ * these frames instead of dropping them.
+ *
+ * @param bpid	BMan pool ID that identifies the consumer's frames.
+ * @param fn	Callback function for frame delivery.
+ * @param app	Opaque argument passed to callback.
+ * @return	0 on success, ENOSPC if registry is full.
+ */
+int		dpaa_oh_register_dist_cb(uint8_t bpid,
+		    dpaa_oh_dist_cb_t fn, t_Handle app);
+void		dpaa_oh_unregister_dist_cb(uint8_t bpid);
+dpaa_oh_dist_cb_t dpaa_oh_lookup_dist_cb(uint8_t bpid, t_Handle *app);
 
 #endif /* DPAA_OH_H_ */
