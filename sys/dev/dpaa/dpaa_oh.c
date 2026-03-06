@@ -71,6 +71,10 @@
 #include "qman.h"
 #include "dpaa_oh.h"
 
+/* From if_dtsec.h — avoid pulling in full header's if_t/uma deps */
+void		dtsec_rm_buf_free_external(uint8_t bpid, void *buf);
+void		dtsec_rm_pool_rx_refill_bpid(uint8_t bpid);
+
 
 /**
  * @group OH port private defines.
@@ -181,10 +185,17 @@ dpaa_oh_err_cb(t_Handle app, t_Handle fqr, t_Handle portal,
     uint32_t fqid_off, t_DpaaFD *frame)
 {
 	struct dpaa_oh_softc *sc;
+	void *buf;
 
 	sc = app;
-	device_printf(sc->sc_dev, "error frame: status 0x%08x\n",
-	    DPAA_FD_GET_STATUS(frame));
+	device_printf(sc->sc_dev, "error frame: status 0x%08x bpid=%u\n",
+	    DPAA_FD_GET_STATUS(frame), frame->bpid);
+
+	buf = DPAA_FD_GET_ADDR(frame);
+	if (buf != NULL) {
+		dtsec_rm_buf_free_external(frame->bpid, buf);
+		dtsec_rm_pool_rx_refill_bpid(frame->bpid);
+	}
 
 	return (e_RX_STORE_RESPONSE_CONTINUE);
 }
@@ -504,6 +515,36 @@ dpaa_oh_lookup_dist_cb(uint8_t bpid, t_Handle *app)
 	}
 	return (NULL);
 }
+
+/*
+ * Fallback callback for distribution FQ frames that don't match
+ * any BPID-specific registration.  Used by dpaa_wifi to handle
+ * CDX→WiFi frames carrying dtsec BPIDs on OH port dist FQs.
+ */
+static dpaa_oh_dist_cb_t dpaa_oh_dist_fallback_fn;
+static t_Handle dpaa_oh_dist_fallback_app;
+
+int
+dpaa_oh_register_dist_fallback(dpaa_oh_dist_cb_t fn, t_Handle app)
+{
+
+	dpaa_oh_dist_fallback_fn = fn;
+	dpaa_oh_dist_fallback_app = app;
+	atomic_thread_fence_rel();
+	printf("dpaa_oh: dist fallback callback registered\n");
+	return (0);
+}
+
+dpaa_oh_dist_cb_t
+dpaa_oh_lookup_dist_fallback(t_Handle *app)
+{
+	dpaa_oh_dist_cb_t fn;
+
+	fn = dpaa_oh_dist_fallback_fn;
+	if (fn != NULL)
+		*app = dpaa_oh_dist_fallback_app;
+	return (fn);
+}
 /** @} */
 
 
@@ -589,10 +630,11 @@ dpaa_oh_enqueue(device_t dev, t_DpaaFD *fd)
 		return (ENXIO);
 
 	error = qman_fqr_enqueue(sc->sc_tx_fqr, 0, fd);
-	if (error != E_OK)
-		return (EIO);
-
-	return (0);
+	if (error == E_OK)
+		return (0);
+	if (GET_ERROR_TYPE(error) == E_BUSY)
+		return (EBUSY);
+	return (EIO);
 }
 
 int
@@ -635,4 +677,60 @@ static driver_t dpaa_oh_driver = {
 
 DRIVER_MODULE(dpaa_oh, fman, dpaa_oh_driver, 0, 0);
 MODULE_VERSION(dpaa_oh, 1);
+
+/*
+ * Per-VAP distribution FQ registry.
+ *
+ * dpaa_wifi registers base FQID + count for each WiFi VAP.
+ * CDX queries dpaa_oh_get_vap_fwd_fqid() to get hash-distributed
+ * FQIDs for CDX→WiFi download frames.
+ */
+static struct {
+	uint32_t	base_fqid;
+	uint32_t	count;		/* must be power of 2 */
+	bool		active;
+} dpaa_oh_vap_fwd[DPAA_OH_MAX_VAPS];
+
+int
+dpaa_oh_register_vap_fwd_fqs(int vap_idx, uint32_t base_fqid,
+    uint32_t count)
+{
+
+	if (vap_idx < 0 || vap_idx >= DPAA_OH_MAX_VAPS)
+		return (EINVAL);
+	if ((count & (count - 1)) != 0)
+		return (EINVAL);	/* must be power of 2 */
+
+	dpaa_oh_vap_fwd[vap_idx].base_fqid = base_fqid;
+	dpaa_oh_vap_fwd[vap_idx].count = count;
+	atomic_thread_fence_rel();
+	dpaa_oh_vap_fwd[vap_idx].active = true;
+
+	printf("dpaa_oh: vap %d FWD FQs registered: base %u, count %u\n",
+	    vap_idx, base_fqid, count);
+	return (0);
+}
+
+void
+dpaa_oh_unregister_vap_fwd_fqs(int vap_idx)
+{
+
+	if (vap_idx >= 0 && vap_idx < DPAA_OH_MAX_VAPS) {
+		dpaa_oh_vap_fwd[vap_idx].active = false;
+		atomic_thread_fence_rel();
+	}
+}
+
+int
+dpaa_oh_get_vap_fwd_fqid(int vap_idx, uint32_t *fqid, uint32_t hash)
+{
+
+	if (vap_idx < 0 || vap_idx >= DPAA_OH_MAX_VAPS ||
+	    !dpaa_oh_vap_fwd[vap_idx].active)
+		return (-1);
+
+	*fqid = dpaa_oh_vap_fwd[vap_idx].base_fqid +
+	    (hash & (dpaa_oh_vap_fwd[vap_idx].count - 1));
+	return (0);
+}
 /** @} */

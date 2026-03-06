@@ -167,11 +167,14 @@ e_FmPortType	dtsec_fm_port_tx_type(enum eth_dev_type type);
 /**
  * @group dTSEC external buffer release.
  *
- * Used by dpaa_wifi.ko to free BMan buffers from dtsec RX pools
- * back to the correct UMA zone with proper consumption model accounting.
+ * Used by dpaa_wifi.ko and dpaa_oh.ko to free BMan buffers from
+ * dtsec RX pools.  Callers must also call dtsec_rm_pool_rx_refill_bpid()
+ * to prevent permanent pool depletion from CDX-offloaded frames that
+ * bypass dtsec_rm_fqr_rx_cb's normal refill path.
  * @{
  */
 void		dtsec_rm_buf_free_external(uint8_t bpid, void *buf);
+void		dtsec_rm_pool_rx_refill_bpid(uint8_t bpid);
 /** @} */
 
 /**
