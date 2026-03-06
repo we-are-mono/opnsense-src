@@ -73,7 +73,9 @@ uint32_t	dpaa_oh_get_data_offset(device_t dev);
  *
  * @param dev	The OH port device.
  * @param fd	The frame descriptor to enqueue.
- * @return	0 on success, errno on failure.
+ * @return	0 on success, EBUSY if the portal EQCR ring is full
+ *		(caller should retry), EIO on other errors, ENXIO if
+ *		the port is not initialized.
  */
 int		dpaa_oh_enqueue(device_t dev, t_DpaaFD *fd);
 
@@ -113,5 +115,25 @@ int		dpaa_oh_register_dist_cb(uint8_t bpid,
 		    dpaa_oh_dist_cb_t fn, t_Handle app);
 void		dpaa_oh_unregister_dist_cb(uint8_t bpid);
 dpaa_oh_dist_cb_t dpaa_oh_lookup_dist_cb(uint8_t bpid, t_Handle *app);
+
+int		dpaa_oh_register_dist_fallback(dpaa_oh_dist_cb_t fn,
+		    t_Handle app);
+dpaa_oh_dist_cb_t dpaa_oh_lookup_dist_fallback(t_Handle *app);
+
+/*
+ * Per-VAP distribution FQ registry.
+ *
+ * dpaa_wifi creates per-VAP FQs for CDX→WiFi download distribution
+ * (matching Linux VWD wlan_fq_from_fman[64]).  It registers the base
+ * FQID + count here.  CDX queries this to get hash-distributed FQIDs.
+ */
+#define DPAA_OH_MAX_VAPS	4
+#define DPAA_OH_FWD_FQ_MAX	64
+
+int		dpaa_oh_register_vap_fwd_fqs(int vap_idx,
+		    uint32_t base_fqid, uint32_t count);
+void		dpaa_oh_unregister_vap_fwd_fqs(int vap_idx);
+int		dpaa_oh_get_vap_fwd_fqid(int vap_idx, uint32_t *fqid,
+		    uint32_t hash);
 
 #endif /* DPAA_OH_H_ */
