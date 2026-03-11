@@ -411,6 +411,8 @@ dtsec_setup_multicast(struct dtsec_softc *sc)
 	if_foreach_llmaddr(sc->sc_ifnet, dtsec_hash_maddr, sc);
 }
 
+static void	dtsec_if_tick(void *arg);
+
 static int
 dtsec_if_enable_locked(struct dtsec_softc *sc)
 {
@@ -430,9 +432,26 @@ dtsec_if_enable_locked(struct dtsec_softc *sc)
 	if (error != E_OK)
 		return (EIO);
 
+	/* Reprogram hardware MAC address from current stack address.
+	 * LAGG changes the stack MAC via if_setlladdr() then cycles
+	 * SIOCSIFFLAGS, which reaches here — not dtsec_if_init_locked().
+	 * Safe to call unconditionally; no-op if address hasn't changed. */
+	error = FM_MAC_ModifyMacAddr(sc->sc_mach,
+	    (t_EnetAddr *)if_getlladdr(sc->sc_ifnet));
+	if (error != E_OK)
+		return (EIO);
+
 	dtsec_setup_multicast(sc);
 
 	if_setdrvflagbits(sc->sc_ifnet, IFF_DRV_RUNNING, 0);
+
+	/* Start MII tick if not already running.
+	 * dtsec_if_init_locked() starts this, but LAGG member ports
+	 * are enabled via SIOCSIFFLAGS → dtsec_if_enable_locked()
+	 * without going through if_init(), so the tick never starts.
+	 * callout_reset is idempotent — safe to call if already running. */
+	if (sc->sc_mii != NULL)
+		callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
 
 	/* Refresh link state */
 	dtsec_miibus_statchg(sc->sc_dev);
