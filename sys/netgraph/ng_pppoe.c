@@ -111,6 +111,14 @@ static const struct ng_parse_type ng_pppoe_sts_state_type = {
 	&ng_pppoe_sts_type_fields
 };
 
+/* Parse type for struct ngpppoe_session_info */
+static const struct ng_parse_struct_field ng_pppoe_session_info_type_fields[]
+	= NG_PPPOE_SESSION_INFO_TYPE_INFO;
+static const struct ng_parse_type ng_pppoe_session_info_type = {
+	&ng_parse_struct_type,
+	&ng_pppoe_session_info_type_fields
+};
+
 /* List of commands and how to convert arguments to/from ASCII */
 static const struct ng_cmdlist ng_pppoe_cmds[] = {
 	{
@@ -204,6 +212,13 @@ static const struct ng_cmdlist ng_pppoe_cmds[] = {
 	  &ngpppoe_init_data_state_type,
 	  NULL
         },
+	{
+	  NGM_PPPOE_COOKIE,
+	  NGM_PPPOE_GET_SESSION_INFO,
+	  "pppoe_get_session_info",
+	  NULL,
+	  &ng_pppoe_session_info_type
+	},
 	{ 0 }
 };
 
@@ -1146,6 +1161,102 @@ ng_pppoe_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			privp->max_payload.hdr.tag_len = htons(sizeof(uint16_t));
 			privp->max_payload.data = htons(*((uint16_t *)msg->data));
 			break;
+		case NGM_PPPOE_GET_SESSION_INFO:
+		    {
+			struct ngpppoe_session_info *info;
+
+			if (msg->header.arglen >= sizeof(*ourmsg)) {
+				/*
+				 * Hook name provided — return info for
+				 * that single session.
+				 */
+				ourmsg = (struct ngpppoe_init_data *)msg->data;
+				ourmsg->hook[sizeof(ourmsg->hook) - 1] = '\0';
+				hook = ng_findhook(node, ourmsg->hook);
+				if (hook == NULL)
+					LEAVE(ENOENT);
+				sp = NG_HOOK_PRIVATE(hook);
+				if (sp == NULL)
+					LEAVE(EINVAL);
+
+				NG_MKRESPONSE(resp, msg, sizeof(*info),
+				    M_NOWAIT);
+				if (resp == NULL)
+					LEAVE(ENOMEM);
+
+				info = (struct ngpppoe_session_info *)resp->data;
+				strlcpy(info->hook, NG_HOOK_NAME(hook),
+				    sizeof(info->hook));
+				info->session_id = sp->Session_ID;
+				bcopy(sp->pkt_hdr.eh.ether_dhost,
+				    info->peer_mac, ETHER_ADDR_LEN);
+				info->state = sp->state;
+			} else {
+				/*
+				 * No args — return array of all connected
+				 * sessions.
+				 */
+				struct sess_con *ssp;
+				int count, i, bucket;
+
+				/* Count connected sessions. */
+				count = 0;
+				for (bucket = 0; bucket < SESSHASHSIZE;
+				    bucket++) {
+					mtx_lock(&privp->sesshash[bucket].mtx);
+					LIST_FOREACH(ssp,
+					    &privp->sesshash[bucket].head,
+					    sessions) {
+						if (ssp->state ==
+						    PPPOE_CONNECTED ||
+						    ssp->state ==
+						    PPPOE_NEWCONNECTED)
+							count++;
+					}
+					mtx_unlock(&privp->sesshash[bucket].mtx);
+				}
+
+				if (count == 0)
+					LEAVE(ENOENT);
+
+				NG_MKRESPONSE(resp, msg,
+				    count * sizeof(*info), M_NOWAIT);
+				if (resp == NULL)
+					LEAVE(ENOMEM);
+
+				info = (struct ngpppoe_session_info *)resp->data;
+				i = 0;
+				for (bucket = 0; bucket < SESSHASHSIZE &&
+				    i < count; bucket++) {
+					mtx_lock(&privp->sesshash[bucket].mtx);
+					LIST_FOREACH(ssp,
+					    &privp->sesshash[bucket].head,
+					    sessions) {
+						if (i >= count)
+							break;
+						if (ssp->state !=
+						    PPPOE_CONNECTED &&
+						    ssp->state !=
+						    PPPOE_NEWCONNECTED)
+							continue;
+						strlcpy(info[i].hook,
+						    NG_HOOK_NAME(ssp->hook),
+						    sizeof(info[i].hook));
+						info[i].session_id =
+						    ssp->Session_ID;
+						bcopy(ssp->pkt_hdr.eh.ether_dhost,
+						    info[i].peer_mac,
+						    ETHER_ADDR_LEN);
+						info[i].state = ssp->state;
+						i++;
+					}
+					mtx_unlock(&privp->sesshash[bucket].mtx);
+				}
+				/* Trim response if fewer found on second pass */
+				resp->header.arglen = i * sizeof(*info);
+			}
+			break;
+		    }
 		case NGM_PPPOE_SEND_HURL:
 		    {
 			struct mbuf *m;
