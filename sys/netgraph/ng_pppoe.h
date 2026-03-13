@@ -88,7 +88,8 @@ enum cmd {
 	NGM_PPPOE_SEND_HURL = 16, /* Send PADM HURL message */
 	NGM_PPPOE_HURL      = 17, /* HURL for informational purposes */
 	NGM_PPPOE_SEND_MOTM = 18, /* Send PADM MOTM message */
-	NGM_PPPOE_MOTM      = 19  /* MOTM for informational purposes */
+	NGM_PPPOE_MOTM      = 19, /* MOTM for informational purposes */
+	NGM_PPPOE_GET_SESSION_INFO = 20 /* Query session params for offload */
 };
 
 /***********************
@@ -280,5 +281,28 @@ struct maxptag {
 #define TAGS_COOKIE 2
 #define TAGS_HUNIQ 3
 /* for PADT */
+
+/*
+ * Returned by NGM_PPPOE_GET_SESSION_INFO.
+ *
+ * If sent with a hook name (struct ngpppoe_init_data, data_len=0),
+ * returns info for that one session.  If sent with arglen=0,
+ * returns an array of all connected sessions.
+ */
+struct ngpppoe_session_info {
+	char		hook[NG_HOOKSIZ];	/* hook name */
+	uint16_t	session_id;		/* PPPoE session ID (host order) */
+	uint8_t		peer_mac[ETHER_ADDR_LEN]; /* AC/peer MAC address */
+	uint8_t		state;			/* enum state value */
+	uint8_t		_pad;
+};
+
+#define NG_PPPOE_SESSION_INFO_TYPE_INFO	{			\
+	  { "hook",		&ng_parse_hookbuf_type	},	\
+	  { "session_id",	&ng_parse_uint16_type	},	\
+	  { "peer_mac",		&ng_parse_enaddr_type	},	\
+	  { "state",		&ng_parse_uint8_type	},	\
+	  { NULL }						\
+}
 
 #endif /* _NETGRAPH_NG_PPPOE_H_ */
