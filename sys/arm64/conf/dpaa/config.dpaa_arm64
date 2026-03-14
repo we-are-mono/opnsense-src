@@ -24,6 +24,6 @@ makeoptions DPAA_COMPILE_CMD="${LINUXKPI_C} ${DPAAWARNFLAGS} \
 	-I$S/contrib/ncsw/inc/integrations"
 
 makeoptions FMCD_COMPILE_CMD="${DPAA_COMPILE_CMD} \
-	-I$S/../../ASK/freebsd/fmlib/include/fmd \
-	-I$S/../../ASK/freebsd/fmlib/include/fmd/Peripherals \
-	-I$S/../../ASK/freebsd/fmlib/include/fmd/integrations"
+	-I$S/../../opnsense-deps/fastpath/fmlib/include/fmd \
+	-I$S/../../opnsense-deps/fastpath/fmlib/include/fmd/Peripherals \
+	-I$S/../../opnsense-deps/fastpath/fmlib/include/fmd/integrations"
