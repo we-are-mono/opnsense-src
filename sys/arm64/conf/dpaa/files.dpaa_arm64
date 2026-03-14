@@ -108,7 +108,7 @@ dev/dpaa/qman_fdt.c				optional dpaa fdt	\
 dev/dpaa/fman.c				optional dpaa fdt		\
 	no-depend compile-with "${DPAA_COMPILE_CMD}"
 dev/dpaa/fman_chardev.c			optional dpaa fdt	\
-	no-depend compile-with "${FMCD_COMPILE_CMD}"
+	no-depend compile-with "${DPAA_COMPILE_CMD}"
 dev/dpaa/fman_fdt.c				optional dpaa fdt	\
 	no-depend compile-with "${DPAA_COMPILE_CMD}"
 # mEMAC external MDIO controller (fsl,fman-memac-mdio)
