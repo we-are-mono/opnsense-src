@@ -46,7 +46,7 @@
 
 /*
  * fmlib ioctl ABI headers — authoritative struct/ioctl definitions.
- * These are included via FMCD_COMPILE_CMD -I paths (see config.dpaa_arm64).
+ * Located in contrib/ncsw/inc/ioctls/ (included via DPAA_COMPILE_CMD).
  */
 #include "fm_pcd_ioctls.h"
 
