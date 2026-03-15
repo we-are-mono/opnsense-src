@@ -808,12 +808,18 @@ dtsec_sfp_insert_task(void *arg, int pending)
 
 	sc->sc_sfp_modstate = 1;
 
-	/* Check initial LOS state */
-	if (sc->sc_sfp_los != NULL) {
+	/* Check initial link state.
+	 * Copper PHY modules (RJ45) deassert LOS when powered up, not
+	 * when link is established — LOS is unreliable for them.
+	 * Report DOWN until a PHY driver can negotiate. */
+	if (sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] == SFP_CONNECTOR_RJ45) {
+		sc->sc_sfp_los_prev = true;
+		if_link_state_change(sc->sc_ifnet, LINK_STATE_DOWN);
+	} else if (sc->sc_sfp_los != NULL) {
 		gpio_pin_is_active(sc->sc_sfp_los, &los);
 		sc->sc_sfp_los_prev = los;
-		if (!los)
-			if_link_state_change(sc->sc_ifnet, LINK_STATE_UP);
+		if_link_state_change(sc->sc_ifnet,
+		    los ? LINK_STATE_DOWN : LINK_STATE_UP);
 	} else {
 		/* No LOS GPIO — assume link up when module present */
 		sc->sc_sfp_los_prev = false;
@@ -848,7 +854,7 @@ dtsec_sfp_poll(struct dtsec_softc *sc)
 		/* Module removed */
 		if (sc->sc_sfp_txdis != NULL)
 			gpio_pin_set_active(sc->sc_sfp_txdis, true);
-		if_link_state_change(sc->sc_ifnet, LINK_STATE_DOWN);
+		if_link_state_change(sc->sc_ifnet, LINK_STATE_UNKNOWN);
 		sc->sc_sfp_modstate = 0;
 		sc->sc_sfp_los_prev = true;
 		memset(sc->sc_sfp_id, 0, sizeof(sc->sc_sfp_id));
@@ -856,8 +862,10 @@ dtsec_sfp_poll(struct dtsec_softc *sc)
 		return;
 	}
 
-	/* Steady state — poll LOS for link changes */
-	if (sc->sc_sfp_modstate == 1 && sc->sc_sfp_los != NULL) {
+	/* Steady state — poll LOS for link changes.
+	 * Skip for copper PHY modules (LOS unreliable). */
+	if (sc->sc_sfp_modstate == 1 && sc->sc_sfp_los != NULL &&
+	    sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] != SFP_CONNECTOR_RJ45) {
 		gpio_pin_is_active(sc->sc_sfp_los, &los);
 		if (los != sc->sc_sfp_los_prev) {
 			sc->sc_sfp_los_prev = los;
@@ -1249,14 +1257,10 @@ dtsec_attach(device_t dev)
 	else
 		if_setbaudrate(ifp, IF_Gbps(1ULL));
 
-	/* 10G ports: SFP starts with link down (poll brings it up),
+	/* 10G ports: SFP leaves default LINK_STATE_UNKNOWN (no module),
 	 * non-SFP assumes always up (legacy) */
-	if (sc->sc_phy_addr < 0) {
-		if (sc->sc_sfp_moddef0 != NULL)
-			if_link_state_change(ifp, LINK_STATE_DOWN);
-		else
-			if_link_state_change(ifp, LINK_STATE_UP);
-	}
+	if (sc->sc_phy_addr < 0 && sc->sc_sfp_moddef0 == NULL)
+		if_link_state_change(ifp, LINK_STATE_UP);
 
 	/* Add diagnostic sysctls */
 	if (sc->sc_mode == DTSEC_MODE_REGULAR) {
