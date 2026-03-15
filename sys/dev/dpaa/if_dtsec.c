@@ -589,6 +589,7 @@ dtsec_if_deinit_locked(struct dtsec_softc *sc)
 	DTSEC_UNLOCK(sc);
 	callout_drain(&sc->sc_tick_callout);
 	taskqueue_drain(taskqueue_thread, &sc->sc_sfp_task);
+	taskqueue_drain(taskqueue_thread, &sc->sc_sfp_phy_task);
 	DTSEC_LOCK(sc);
 }
 
@@ -685,6 +686,56 @@ dtsec_if_watchdog(if_t ifp)
 /* I2C address for SFP EEPROM (A0h page, 7-bit) */
 #define	SFP_I2C_ADDR		0x50
 
+/* IEEE 802.3 Clause 45 MMD device numbers */
+#define	MDIO_MMD_PMAPMD		1	/* PMA/PMD */
+#define	MDIO_MMD_AN		7	/* Auto-Negotiation */
+
+/* Standard C45 register offsets */
+#define	MDIO_CTRL1		0
+#define	MDIO_STAT1		1
+#define	MDIO_DEVID1		2
+#define	MDIO_DEVID2		3
+#define	MDIO_PMA_EXTABLE	11
+#define	MDIO_PMA_NG_EXTABLE	21
+#define	MDIO_AN_ADVERTISE	16
+#define	MDIO_AN_LPA		19
+#define	MDIO_AN_10GBT_CTRL	32
+#define	MDIO_AN_10GBT_STAT	33
+
+/* STAT1 bits */
+#define	MDIO_STAT1_LSTATUS		(1 << 2)
+
+/* AN CTRL1 bits */
+#define	MDIO_AN_CTRL1_XNP		(1 << 13)
+#define	MDIO_AN_CTRL1_ENABLE		(1 << 12)
+#define	MDIO_AN_CTRL1_RESTART		(1 << 9)
+
+/* AN STAT1 bits */
+#define	MDIO_AN_STAT1_COMPLETE		(1 << 5)
+
+/* PMA EXTABLE bits */
+#define	MDIO_PMA_EXTABLE_10GBT		(1 << 2)
+#define	MDIO_PMA_EXTABLE_1000BT	(1 << 5)
+#define	MDIO_PMA_EXTABLE_NBT		(1 << 14)
+
+/* PMA NG_EXTABLE bits (NBASE-T) */
+#define	MDIO_PMA_NG_EXTABLE_2_5GBT	(1 << 0)
+#define	MDIO_PMA_NG_EXTABLE_5GBT	(1 << 1)
+
+/* AN 10GBT_CTRL advertisement bits */
+#define	MDIO_AN_10GBT_CTRL_ADV10G	(1 << 12)
+#define	MDIO_AN_10GBT_CTRL_ADV5G	(1 << 8)
+#define	MDIO_AN_10GBT_CTRL_ADV2_5G	(1 << 7)
+
+/* AN 10GBT_STAT link partner bits */
+#define	MDIO_AN_10GBT_STAT_LP10G	(1 << 11)
+#define	MDIO_AN_10GBT_STAT_LP5G		(1 << 6)
+#define	MDIO_AN_10GBT_STAT_LP2_5G	(1 << 5)
+
+/* AN base page advertisement bits (reg 16) */
+
+#define	MDIO_AN_ADV_1000BT_HDX		(1 << 6)
+
 static int
 dtsec_sfp_read_eeprom(struct dtsec_softc *sc)
 {
@@ -765,11 +816,631 @@ dtsec_sfp_log_module(struct dtsec_softc *sc)
 	    connector == SFP_CONNECTOR_RJ45 ? " RJ45" : "");
 }
 
+/*
+ * Standard I2C-MDIO bridge (SFF-8472) for Clause 45 PHY access.
+ * PHY address 22 mapped to I2C address 0x56 (phy_addr + 0x40).
+ * Read: write [0x20|devad, reg_hi, reg_lo], read 2 bytes.
+ * Write: write [devad, reg_hi, reg_lo, val_hi, val_lo].
+ * Reference: Linux drivers/net/mdio/mdio-i2c.c
+ */
+#define	MDIOI2C_I2C_ADDR	0x56
+
+static int
+mdioi2c_read(struct dtsec_softc *sc, int devad, int reg)
+{
+	struct iic_msg msgs[2];
+	uint8_t addr[3], data[2];
+	int error;
+
+	addr[0] = 0x20 | (devad & 0x1F);
+	addr[1] = (reg >> 8) & 0xFF;
+	addr[2] = reg & 0xFF;
+
+	msgs[0].slave = MDIOI2C_I2C_ADDR << 1;
+	msgs[0].flags = IIC_M_WR;
+	msgs[0].len = 3;
+	msgs[0].buf = addr;
+	msgs[1].slave = MDIOI2C_I2C_ADDR << 1;
+	msgs[1].flags = IIC_M_RD;
+	msgs[1].len = 2;
+	msgs[1].buf = data;
+
+	error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev, IIC_INTRWAIT);
+	if (error != 0)
+		return (-1);
+	error = iicbus_transfer(sc->sc_sfp_i2c, msgs, 2);
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+	if (error != 0)
+		return (-1);
+	return ((data[0] << 8) | data[1]);
+}
+
+static int
+mdioi2c_write(struct dtsec_softc *sc, int devad, int reg, int val)
+{
+	struct iic_msg msg;
+	uint8_t buf[5];
+	int error;
+
+	buf[0] = devad & 0x1F;
+	buf[1] = (reg >> 8) & 0xFF;
+	buf[2] = reg & 0xFF;
+	buf[3] = (val >> 8) & 0xFF;
+	buf[4] = val & 0xFF;
+
+	msg.slave = MDIOI2C_I2C_ADDR << 1;
+	msg.flags = IIC_M_WR;
+	msg.len = 5;
+	msg.buf = buf;
+
+	error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev, IIC_INTRWAIT);
+	if (error != 0)
+		return (error);
+	error = iicbus_transfer(sc->sc_sfp_i2c, &msg, 1);
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+	return (error);
+}
+
+/*
+ * RollBall I2C-to-MDIO bridge for Clause 45 PHY access.
+ * Used by FLEXOPTIX and many other 10GBASE-T SFP+ modules.
+ * PHY registers are accessed via a mailbox at I2C address 0x51:
+ *   - Page register at offset 0x7F selects EEPROM page
+ *   - Command/data at offsets 0x80-0x85 on page 3
+ * Protocol: write devad+reg+cmd, poll for DONE, read result.
+ * Must be called from sleepable context (taskqueue).
+ *
+ * Reference: Linux drivers/net/mdio/mdio-i2c.c
+ */
+#define	ROLLBALL_I2C_ADDR	0x51
+#define	ROLLBALL_PAGE_REG	0x7F	/* SFP page select register */
+#define	ROLLBALL_PAGE		3	/* page for PHY access */
+#define	ROLLBALL_PASSWORD_REG	0x7B	/* password register */
+#define	ROLLBALL_CMD_ADDR	0x80	/* command register */
+#define	ROLLBALL_DATA_ADDR	0x81	/* data start register */
+#define	ROLLBALL_CMD_READ	0x02
+#define	ROLLBALL_CMD_WRITE	0x01
+#define	ROLLBALL_CMD_DONE	0x04
+#define	ROLLBALL_POLL_RETRIES	20
+#define	ROLLBALL_POLL_MS	20
+
+/*
+ * Low-level I2C helpers for RollBall.
+ * Bus must already be acquired by caller.
+ */
+static int
+rollball_i2c_write(struct dtsec_softc *sc, uint8_t *buf, int len)
+{
+	struct iic_msg msg;
+
+	msg.slave = ROLLBALL_I2C_ADDR << 1;
+	msg.flags = IIC_M_WR;
+	msg.len = len;
+	msg.buf = buf;
+	return (iicbus_transfer(sc->sc_sfp_i2c, &msg, 1));
+}
+
+static int
+rollball_i2c_read(struct dtsec_softc *sc, uint8_t reg, uint8_t *buf, int len)
+{
+	struct iic_msg msgs[2];
+
+	msgs[0].slave = ROLLBALL_I2C_ADDR << 1;
+	msgs[0].flags = IIC_M_WR;
+	msgs[0].len = 1;
+	msgs[0].buf = &reg;
+	msgs[1].slave = ROLLBALL_I2C_ADDR << 1;
+	msgs[1].flags = IIC_M_RD;
+	msgs[1].len = len;
+	msgs[1].buf = buf;
+	return (iicbus_transfer(sc->sc_sfp_i2c, msgs, 2));
+}
+
+/*
+ * Send RollBall password (one-time init after module insertion).
+ * Must be called with I2C bus NOT held.
+ */
+static int
+dtsec_sfp_phy_rollball_init(struct dtsec_softc *sc)
+{
+	uint8_t pw[] = { ROLLBALL_PASSWORD_REG, 0xFF, 0xFF, 0xFF, 0xFF };
+	int error;
+
+	error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev,
+	    IIC_INTRWAIT);
+	if (error != 0)
+		return (error);
+	error = rollball_i2c_write(sc, pw, sizeof(pw));
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+	return (error);
+}
+
+/*
+ * Save current page, switch to RollBall page 3.
+ * Bus must already be acquired.
+ */
+static int
+rollball_page_set(struct dtsec_softc *sc, uint8_t *saved_page)
+{
+	uint8_t buf[2];
+	int error;
+
+	/* Read current page */
+	error = rollball_i2c_read(sc, ROLLBALL_PAGE_REG, saved_page, 1);
+	if (error != 0)
+		return (error);
+
+	/* Set page 3 — must be a separate transfer */
+	buf[0] = ROLLBALL_PAGE_REG;
+	buf[1] = ROLLBALL_PAGE;
+	return (rollball_i2c_write(sc, buf, 2));
+}
+
+/*
+ * Restore saved page.  Bus must already be acquired.
+ */
+static int
+rollball_page_restore(struct dtsec_softc *sc, uint8_t saved_page)
+{
+	uint8_t buf[2] = { ROLLBALL_PAGE_REG, saved_page };
+
+	return (rollball_i2c_write(sc, buf, 2));
+}
+
+static int
+rollball_phy_read(struct dtsec_softc *sc, int devad, int reg)
+{
+	uint8_t data_buf[4], cmd_buf[2], res[6];
+	uint8_t saved_page;
+	int error, i;
+
+	if (sc->sc_sfp_i2c == NULL)
+		return (-1);
+
+	error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev,
+	    IIC_INTRWAIT);
+	if (error != 0)
+		return (-1);
+
+	/* Save page and switch to page 3 */
+	error = rollball_page_set(sc, &saved_page);
+	if (error != 0)
+		goto out;
+
+	/* Write devad + register address */
+	data_buf[0] = ROLLBALL_DATA_ADDR;
+	data_buf[1] = devad;
+	data_buf[2] = (reg >> 8) & 0xFF;
+	data_buf[3] = reg & 0xFF;
+	error = rollball_i2c_write(sc, data_buf, 4);
+	if (error != 0)
+		goto restore;
+
+	/* Write read command */
+	cmd_buf[0] = ROLLBALL_CMD_ADDR;
+	cmd_buf[1] = ROLLBALL_CMD_READ;
+	error = rollball_i2c_write(sc, cmd_buf, 2);
+	if (error != 0)
+		goto restore;
+
+	/* Restore page before polling (each poll does its own page switch) */
+	rollball_page_restore(sc, saved_page);
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+	/* Poll for completion */
+	for (i = 0; i < ROLLBALL_POLL_RETRIES; i++) {
+		pause_sbt("rbpoll", SBT_1MS * ROLLBALL_POLL_MS, 0, C_PREL(2));
+
+		error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev,
+		    IIC_INTRWAIT);
+		if (error != 0)
+			return (-1);
+
+		error = rollball_page_set(sc, &saved_page);
+		if (error != 0) {
+			iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+			return (-1);
+		}
+
+		error = rollball_i2c_read(sc, ROLLBALL_CMD_ADDR, res, 6);
+
+		rollball_page_restore(sc, saved_page);
+		iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+		if (error != 0)
+			return (-1);
+
+		if (res[0] == ROLLBALL_CMD_DONE)
+			return ((res[4] << 8) | res[5]);
+	}
+
+	return (-1);	/* timeout */
+
+restore:
+	rollball_page_restore(sc, saved_page);
+out:
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+	return (-1);
+}
+
+static int
+rollball_phy_write(struct dtsec_softc *sc, int devad, int reg, int val)
+{
+	uint8_t data_buf[6], cmd_buf[2], status;
+	uint8_t saved_page;
+	int error, i;
+
+	if (sc->sc_sfp_i2c == NULL)
+		return (ENXIO);
+
+	error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev,
+	    IIC_INTRWAIT);
+	if (error != 0)
+		return (error);
+
+	error = rollball_page_set(sc, &saved_page);
+	if (error != 0)
+		goto out;
+
+	/* Write devad + register + value */
+	data_buf[0] = ROLLBALL_DATA_ADDR;
+	data_buf[1] = devad;
+	data_buf[2] = (reg >> 8) & 0xFF;
+	data_buf[3] = reg & 0xFF;
+	data_buf[4] = (val >> 8) & 0xFF;
+	data_buf[5] = val & 0xFF;
+	error = rollball_i2c_write(sc, data_buf, 6);
+	if (error != 0)
+		goto restore;
+
+	/* Write write command */
+	cmd_buf[0] = ROLLBALL_CMD_ADDR;
+	cmd_buf[1] = ROLLBALL_CMD_WRITE;
+	error = rollball_i2c_write(sc, cmd_buf, 2);
+	if (error != 0)
+		goto restore;
+
+	rollball_page_restore(sc, saved_page);
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+	/* Poll for completion */
+	for (i = 0; i < ROLLBALL_POLL_RETRIES; i++) {
+		pause_sbt("rbpoll", SBT_1MS * ROLLBALL_POLL_MS, 0, C_PREL(2));
+
+		error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev,
+		    IIC_INTRWAIT);
+		if (error != 0)
+			return (error);
+
+		error = rollball_page_set(sc, &saved_page);
+		if (error != 0) {
+			iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+			return (error);
+		}
+
+		error = rollball_i2c_read(sc, ROLLBALL_CMD_ADDR, &status, 1);
+
+		rollball_page_restore(sc, saved_page);
+		iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+		if (error != 0)
+			return (error);
+
+		if (status == ROLLBALL_CMD_DONE)
+			return (0);
+	}
+
+	return (ETIMEDOUT);
+
+restore:
+	rollball_page_restore(sc, saved_page);
+out:
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+	return (error);
+}
+
+/*
+ * Protocol-dispatching wrappers for PHY register access.
+ * Called by all PHY management code; the probe selects the protocol.
+ */
+static int
+dtsec_sfp_phy_read(struct dtsec_softc *sc, int devad, int reg)
+{
+
+	if (sc->sc_sfp_phy_proto == DTSEC_SFP_PHY_MDIOI2C)
+		return (mdioi2c_read(sc, devad, reg));
+	return (rollball_phy_read(sc, devad, reg));
+}
+
+static int
+dtsec_sfp_phy_write(struct dtsec_softc *sc, int devad, int reg, int val)
+{
+
+	if (sc->sc_sfp_phy_proto == DTSEC_SFP_PHY_MDIOI2C)
+		return (mdioi2c_write(sc, devad, reg, val));
+	return (rollball_phy_write(sc, devad, reg, val));
+}
+
+/*
+ * Configure auto-negotiation for 10GBASE-T.
+ * Advertises all speeds the PHY supports, then restarts AN.
+ */
+static void
+dtsec_sfp_phy_config_aneg(struct dtsec_softc *sc)
+{
+	int adv10g;
+
+	/* Advertise 10GBASE-T and NBASE-T speeds in register 7.32.
+	 * 1000BASE-T is advertised by the PHY firmware via extended
+	 * next pages automatically — no explicit config needed. */
+	adv10g = MDIO_AN_10GBT_CTRL_ADV10G |
+	    MDIO_AN_10GBT_CTRL_ADV5G | MDIO_AN_10GBT_CTRL_ADV2_5G;
+	dtsec_sfp_phy_write(sc, MDIO_MMD_AN, MDIO_AN_10GBT_CTRL, adv10g);
+
+	/* Enable and restart AN.  XNP (Extended Next Page) is critical —
+	 * 10GBASE-T capability is exchanged via extended next pages.
+	 * Without XNP, only base-page speeds (1G and below) negotiate. */
+	dtsec_sfp_phy_write(sc, MDIO_MMD_AN, MDIO_CTRL1,
+	    MDIO_AN_CTRL1_XNP | MDIO_AN_CTRL1_ENABLE |
+	    MDIO_AN_CTRL1_RESTART);
+
+	device_printf(sc->sc_dev, "SFP+ PHY: auto-negotiation started\n");
+}
+
+/*
+ * Probe for a Clause 45 PHY inside an SFP+ copper module.
+ * Reads PHY ID, logs it, configures auto-negotiation.
+ * Must be called from sleepable context.
+ */
+static void
+dtsec_sfp_phy_probe(struct dtsec_softc *sc)
+{
+	int id1, id2, err, retry;
+	uint32_t phy_id;
+	int extable;
+
+	id1 = -1;
+
+	/*
+	 * Try RollBall protocol first (I2C addr 0x51, page 3).
+	 * Most 10GBASE-T SFP+ modules use this.
+	 */
+	sc->sc_sfp_phy_proto = DTSEC_SFP_PHY_ROLLBALL;
+	err = dtsec_sfp_phy_rollball_init(sc);
+	if (err == 0) {
+		/*
+		 * Poll for PHY to become responsive.  PHY firmware
+		 * inside 10GBASE-T SFP+ modules can take several
+		 * seconds to boot.  Try up to 4.5 seconds.
+		 */
+		for (retry = 0; retry < 9; retry++) {
+			pause_sbt("phyboot", SBT_1MS * 500, 0, C_PREL(2));
+
+			id1 = dtsec_sfp_phy_read(sc, MDIO_MMD_PMAPMD,
+			    MDIO_DEVID1);
+			if (id1 > 0 && id1 != 0xFFFF)
+				break;
+		}
+	}
+
+	/*
+	 * If RollBall failed, try standard I2C-MDIO (addr 0x56).
+	 * Some modules (e.g. certain FLEXOPTIX) use this instead.
+	 */
+	if (id1 <= 0 || id1 == 0xFFFF) {
+		sc->sc_sfp_phy_proto = DTSEC_SFP_PHY_MDIOI2C;
+		id1 = dtsec_sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_DEVID1);
+	}
+
+	if (id1 <= 0 || id1 == 0xFFFF) {
+		device_printf(sc->sc_dev,
+		    "SFP+ PHY: no C45 PHY detected "
+		    "(tried RollBall and I2C-MDIO)\n");
+		sc->sc_sfp_phy_proto = 0;
+		return;
+	}
+
+	id2 = dtsec_sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_DEVID2);
+	if (id2 < 0 || id2 == 0xFFFF) {
+		device_printf(sc->sc_dev,
+		    "SFP+ PHY: DEVID1=0x%04x but DEVID2 read failed\n",
+		    id1 & 0xFFFF);
+		sc->sc_sfp_phy_proto = 0;
+		return;
+	}
+
+	phy_id = ((uint32_t)id1 << 16) | id2;
+
+	device_printf(sc->sc_dev,
+	    "SFP+ PHY detected via %s: ID %08x "
+	    "(OUI %06x model %02x rev %01x)\n",
+	    sc->sc_sfp_phy_proto == DTSEC_SFP_PHY_ROLLBALL ?
+	    "RollBall" : "I2C-MDIO",
+	    phy_id,
+	    (id1 << 6) | (id2 >> 10),
+	    (id2 >> 4) & 0x3F,
+	    id2 & 0x0F);
+
+	/* Read supported speeds for informational logging */
+	extable = dtsec_sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_PMA_EXTABLE);
+	if (extable >= 0) {
+		device_printf(sc->sc_dev,
+		    "SFP+ PHY abilities: %s%s%s\n",
+		    (extable & MDIO_PMA_EXTABLE_10GBT) ? "10GBASE-T " : "",
+		    (extable & MDIO_PMA_EXTABLE_1000BT) ? "1000BASE-T " : "",
+		    (extable & MDIO_PMA_EXTABLE_NBT) ? "NBASE-T" : "");
+	}
+
+	sc->sc_sfp_phy_id = phy_id;
+	sc->sc_sfp_has_phy = true;
+	sc->sc_sfp_phy_link = false;
+	sc->sc_sfp_phy_speed = 0;
+
+	/* Start auto-negotiation */
+	dtsec_sfp_phy_config_aneg(sc);
+}
+
+/*
+ * Read negotiated speed after AN completes.
+ * Returns speed in Mbps or 0 if unknown.
+ */
+static int
+dtsec_sfp_phy_read_speed(struct dtsec_softc *sc)
+{
+	int stat, lpa10g, ctrl1;
+
+	/* Check if AN is complete */
+	stat = dtsec_sfp_phy_read(sc, MDIO_MMD_AN, MDIO_STAT1);
+	if (stat < 0 || !(stat & MDIO_AN_STAT1_COMPLETE))
+		return (0);
+
+	/* Check 10G/5G/2.5G partner abilities */
+	lpa10g = dtsec_sfp_phy_read(sc, MDIO_MMD_AN, MDIO_AN_10GBT_STAT);
+	if (lpa10g >= 0) {
+		if (lpa10g & MDIO_AN_10GBT_STAT_LP10G)
+			return (10000);
+		if (lpa10g & MDIO_AN_10GBT_STAT_LP5G)
+			return (5000);
+		if (lpa10g & MDIO_AN_10GBT_STAT_LP2_5G)
+			return (2500);
+	}
+
+	/* Read PMA/PMD CTRL1 for actual operating speed.
+	 * 1000BASE-T is negotiated via extended next pages and isn't
+	 * in the base page (reg 7.19) or 10GBT_STAT (reg 7.33).
+	 * PMA/PMD CTRL1 speed select: bit 13 (SS13), bit 6 (SS6):
+	 *   SS13=1: 10G
+	 *   SS13=0, SS6=1: 1G
+	 *   SS13=0, SS6=0: 10M/100M */
+	ctrl1 = dtsec_sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_CTRL1);
+	if (ctrl1 >= 0) {
+		if (ctrl1 & (1 << 13))
+			return (10000);
+		if (ctrl1 & (1 << 6))
+			return (1000);
+		return (100);
+	}
+
+	return (0);
+}
+
+/*
+ * PHY link status poll task — runs in taskqueue_thread (sleepable).
+ * Reads PMA/PMD STAT1 to determine link state, updates ifnet.
+ */
+static void
+dtsec_sfp_phy_poll_task(void *arg, int pending)
+{
+	struct dtsec_softc *sc = arg;
+	int stat, speed;
+	bool link_up;
+
+	/* Module may have been removed between enqueue and execution */
+	if (!sc->sc_sfp_has_phy)
+		return;
+
+	/* Read PMA/PMD link status (standard C45 register) */
+	stat = dtsec_sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_STAT1);
+	if (stat < 0)
+		return;		/* I2C error, skip this poll */
+
+	link_up = (stat & MDIO_STAT1_LSTATUS) != 0;
+
+	/* Detect link state change */
+	if (link_up != sc->sc_sfp_phy_link) {
+		sc->sc_sfp_phy_link = link_up;
+
+		if (link_up) {
+			speed = dtsec_sfp_phy_read_speed(sc);
+			sc->sc_sfp_phy_speed = speed;
+			if (speed > 0)
+				device_printf(sc->sc_dev,
+				    "SFP+ PHY: link up at %d Mbps\n",
+				    speed);
+			else
+				device_printf(sc->sc_dev,
+				    "SFP+ PHY: link up (speed unknown)\n");
+			if_link_state_change(sc->sc_ifnet, LINK_STATE_UP);
+		} else {
+			sc->sc_sfp_phy_speed = 0;
+			device_printf(sc->sc_dev,
+			    "SFP+ PHY: link down\n");
+			if_link_state_change(sc->sc_ifnet, LINK_STATE_DOWN);
+		}
+	}
+
+	/* Keep polling for speed if link is up but speed not yet known
+	 * (AN may complete after PMA link comes up) */
+	if (link_up && sc->sc_sfp_phy_speed == 0) {
+		speed = dtsec_sfp_phy_read_speed(sc);
+		if (speed > 0) {
+			sc->sc_sfp_phy_speed = speed;
+			device_printf(sc->sc_dev,
+			    "SFP+ PHY: negotiated %d Mbps\n", speed);
+		}
+	}
+}
+
+/*
+ * DDM-based link poll for copper modules without accessible PHY.
+ * Reads DDM status byte (A2h offset 0x6E, bit 1 = RX_LOS) via I2C.
+ * Runs in taskqueue_thread (sleepable context).
+ */
+static void
+dtsec_sfp_ddm_poll_task(void *arg, int pending)
+{
+	struct dtsec_softc *sc = arg;
+	struct iic_msg msgs[2];
+	uint8_t reg, ddm_status;
+	int error;
+	bool link_up;
+
+	if (sc->sc_sfp_i2c == NULL || sc->sc_sfp_modstate != 1)
+		return;
+
+	reg = 0x6E;
+	msgs[0].slave = 0x51 << 1;
+	msgs[0].flags = IIC_M_WR;
+	msgs[0].len = 1;
+	msgs[0].buf = &reg;
+	msgs[1].slave = 0x51 << 1;
+	msgs[1].flags = IIC_M_RD;
+	msgs[1].len = 1;
+	msgs[1].buf = &ddm_status;
+
+	error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev, IIC_INTRWAIT);
+	if (error != 0)
+		return;
+	error = iicbus_transfer(sc->sc_sfp_i2c, msgs, 2);
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+	if (error != 0)
+		return;
+
+	/* Bit 1 = RX_LOS: 1 = no signal, 0 = signal present */
+	link_up = (ddm_status & 0x02) == 0;
+
+	if (link_up != sc->sc_sfp_phy_link) {
+		sc->sc_sfp_phy_link = link_up;
+		device_printf(sc->sc_dev, "SFP+ DDM: link %s\n",
+		    link_up ? "up" : "down");
+		if_link_state_change(sc->sc_ifnet,
+		    link_up ? LINK_STATE_UP : LINK_STATE_DOWN);
+	}
+}
+
 static void
 dtsec_sfp_insert_task(void *arg, int pending)
 {
 	struct dtsec_softc *sc = arg;
 	bool present, los;
+
+	/* SFF-8472 T_serial: modules need up to 300ms after power-up
+	 * before I2C EEPROM is accessible. */
+	pause_sbt("sfpwait", SBT_1MS * 300, 0, C_PREL(2));
 
 	/* Read EEPROM (sleeps — runs in taskqueue thread context) */
 	dtsec_sfp_read_eeprom(sc);
@@ -808,14 +1479,19 @@ dtsec_sfp_insert_task(void *arg, int pending)
 
 	sc->sc_sfp_modstate = 1;
 
-	/* Check initial link state.
-	 * Copper PHY modules (RJ45) deassert LOS when powered up, not
-	 * when link is established — LOS is unreliable for them.
-	 * Report DOWN until a PHY driver can negotiate. */
-	if (sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] == SFP_CONNECTOR_RJ45) {
+	/* For copper PHY modules, probe the embedded PHY via I2C-MDIO.
+	 * This starts auto-negotiation; the PHY poll task will track link. */
+	if (sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] == SFP_CONNECTOR_RJ45 &&
+	    sc->sc_sfp_i2c != NULL) {
 		sc->sc_sfp_los_prev = true;
 		if_link_state_change(sc->sc_ifnet, LINK_STATE_DOWN);
-	} else if (sc->sc_sfp_los != NULL) {
+		DTSEC_UNLOCK(sc);
+		dtsec_sfp_phy_probe(sc);
+		return;
+	}
+
+	/* Check initial link state for fiber/DAC modules */
+	if (sc->sc_sfp_los != NULL) {
 		gpio_pin_is_active(sc->sc_sfp_los, &los);
 		sc->sc_sfp_los_prev = los;
 		if_link_state_change(sc->sc_ifnet,
@@ -857,15 +1533,32 @@ dtsec_sfp_poll(struct dtsec_softc *sc)
 		if_link_state_change(sc->sc_ifnet, LINK_STATE_UNKNOWN);
 		sc->sc_sfp_modstate = 0;
 		sc->sc_sfp_los_prev = true;
+		sc->sc_sfp_has_phy = false;
+		sc->sc_sfp_phy_proto = 0;
+		sc->sc_sfp_phy_link = false;
+		sc->sc_sfp_phy_speed = 0;
+		sc->sc_sfp_phy_id = 0;
 		memset(sc->sc_sfp_id, 0, sizeof(sc->sc_sfp_id));
 		device_printf(sc->sc_dev, "SFP+ module removed\n");
 		return;
 	}
 
-	/* Steady state — poll LOS for link changes.
-	 * Skip for copper PHY modules (LOS unreliable). */
-	if (sc->sc_sfp_modstate == 1 && sc->sc_sfp_los != NULL &&
-	    sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] != SFP_CONNECTOR_RJ45) {
+	/* Steady state: PHY-based modules use I2C polling (deferred) */
+	if (sc->sc_sfp_modstate == 1 && sc->sc_sfp_has_phy) {
+		taskqueue_enqueue(taskqueue_thread, &sc->sc_sfp_phy_task);
+		return;
+	}
+
+	/* Steady state: copper modules without PHY — poll DDM RX_LOS */
+	if (sc->sc_sfp_modstate == 1 && !sc->sc_sfp_has_phy &&
+	    sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] == SFP_CONNECTOR_RJ45 &&
+	    sc->sc_sfp_i2c != NULL) {
+		taskqueue_enqueue(taskqueue_thread, &sc->sc_sfp_ddm_task);
+		return;
+	}
+
+	/* Steady state: fiber/DAC modules poll LOS GPIO */
+	if (sc->sc_sfp_modstate == 1 && sc->sc_sfp_los != NULL) {
 		gpio_pin_is_active(sc->sc_sfp_los, &los);
 		if (los != sc->sc_sfp_los_prev) {
 			sc->sc_sfp_los_prev = los;
@@ -905,6 +1598,20 @@ dtsec_ifmedia_sts(if_t ifp, struct ifmediareq *ifmr)
 		mii_pollstat(sc->sc_mii);
 		ifmr->ifm_active = sc->sc_mii->mii_media_active;
 		ifmr->ifm_status = sc->sc_mii->mii_media_status;
+	} else if (sc->sc_sfp_has_phy) {
+		/* SFP+ copper module with embedded PHY */
+		ifmr->ifm_active = IFM_ETHER | IFM_FDX;
+		switch (sc->sc_sfp_phy_speed) {
+		case 10000: ifmr->ifm_active |= IFM_10G_T; break;
+		case 5000:  ifmr->ifm_active |= IFM_5000_T; break;
+		case 2500:  ifmr->ifm_active |= IFM_2500_T; break;
+		case 1000:  ifmr->ifm_active |= IFM_1000_T; break;
+		default:    ifmr->ifm_active |= IFM_10G_T; break;
+		}
+		if (sc->sc_sfp_phy_link)
+			ifmr->ifm_status = IFM_AVALID | IFM_ACTIVE;
+		else
+			ifmr->ifm_status = IFM_AVALID;
 	} else if (sc->sc_sfp_moddef0 != NULL) {
 		/* SFP port with GPIO-based status */
 		ifmr->ifm_active = IFM_ETHER | IFM_10G_SR | IFM_FDX;
@@ -1040,6 +1747,78 @@ dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 				    (unsigned long long)ms.ifOutErrors);
 			}
 		}
+		/* MEMAC register dump for link debugging */
+		if (sc->sc_mem != NULL) {
+			uint32_t cmd_cfg = be32toh(bus_read_4(sc->sc_mem, 0x008));
+			uint32_t ifmode = be32toh(bus_read_4(sc->sc_mem, 0x300));
+			uint32_t ifstat = be32toh(bus_read_4(sc->sc_mem, 0x304));
+			uint32_t ievent = be32toh(bus_read_4(sc->sc_mem, 0x040));
+			printf("%s: MEMAC cmd_cfg=0x%08x [TX_%s RX_%s] "
+			    "IF_MODE=0x%08x [%s] IF_STATUS=0x%08x "
+			    "IEVENT=0x%08x\n",
+			    if_name(sc->sc_ifnet), cmd_cfg,
+			    (cmd_cfg & 0x01) ? "EN" : "DIS",
+			    (cmd_cfg & 0x02) ? "EN" : "DIS",
+			    ifmode,
+			    (ifmode & 0x3) == 0 ? "XGMII/10G" :
+			    (ifmode & 0x3) == 2 ? "GMII/1G" :
+			    (ifmode & 0x3) == 4 ? "RGMII" : "unknown",
+			    ifstat, ievent);
+		}
+		/* SFP GPIO state */
+		if (sc->sc_sfp_moddef0 != NULL) {
+			bool mod_present, los_active;
+			gpio_pin_is_active(sc->sc_sfp_moddef0, &mod_present);
+			printf("%s: SFP GPIO: MOD_DEF0=%s",
+			    if_name(sc->sc_ifnet),
+			    mod_present ? "present" : "absent");
+			if (sc->sc_sfp_los != NULL) {
+				gpio_pin_is_active(sc->sc_sfp_los, &los_active);
+				printf(" LOS=%s", los_active ? "ACTIVE(no signal)" : "INACTIVE(signal OK)");
+			}
+			if (sc->sc_sfp_txdis != NULL) {
+				bool txdis;
+				gpio_pin_is_active(sc->sc_sfp_txdis, &txdis);
+				printf(" TX_DIS=%s", txdis ? "ASSERTED(tx off)" : "DEASSERTED(tx on)");
+			}
+			printf(" has_phy=%d modstate=%d los_prev=%d\n",
+			    sc->sc_sfp_has_phy, sc->sc_sfp_modstate,
+			    sc->sc_sfp_los_prev);
+			/* Read DDM status byte (A2h byte 110 = 0x6E) via I2C */
+			if (sc->sc_sfp_i2c != NULL && mod_present) {
+				struct iic_msg msgs[2];
+				uint8_t reg = 0x6E;
+				uint8_t ddm_status;
+				int err;
+				msgs[0].slave = 0x51 << 1;
+				msgs[0].flags = IIC_M_WR;
+				msgs[0].len = 1;
+				msgs[0].buf = &reg;
+				msgs[1].slave = 0x51 << 1;
+				msgs[1].flags = IIC_M_RD;
+				msgs[1].len = 1;
+				msgs[1].buf = &ddm_status;
+				err = iicbus_request_bus(sc->sc_sfp_i2c,
+				    sc->sc_dev, IIC_INTRWAIT);
+				if (err == 0) {
+					err = iicbus_transfer(
+					    sc->sc_sfp_i2c, msgs, 2);
+					iicbus_release_bus(sc->sc_sfp_i2c,
+					    sc->sc_dev);
+				}
+				if (err == 0) {
+					printf("%s: DDM byte110=0x%02x "
+					    "[TX_DIS_STATE=%d SOFT_TXDIS=%d "
+					    "TX_FAULT=%d RX_LOS=%d]\n",
+					    if_name(sc->sc_ifnet),
+					    ddm_status,
+					    (ddm_status >> 7) & 1,
+					    (ddm_status >> 6) & 1,
+					    (ddm_status >> 2) & 1,
+					    (ddm_status >> 1) & 1);
+				}
+			}
+		}
 	}
 
 	return (0);
@@ -1069,6 +1848,58 @@ dtsec_sysctl_sfp_info(SYSCTL_HANDLER_ARGS)
 	DTSEC_UNLOCK(sc);
 
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+static int
+dtsec_sysctl_sfp_phy(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	char buf[64];
+
+	DTSEC_LOCK(sc);
+
+	if (!sc->sc_sfp_has_phy) {
+		strlcpy(buf, "none", sizeof(buf));
+	} else {
+		snprintf(buf, sizeof(buf), "OUI %06x model %02x rev %x %d Mbps",
+		    (sc->sc_sfp_phy_id >> 10) & 0x3FFFFF,
+		    (sc->sc_sfp_phy_id >> 4) & 0x3F,
+		    sc->sc_sfp_phy_id & 0xF,
+		    sc->sc_sfp_phy_speed);
+	}
+
+	DTSEC_UNLOCK(sc);
+
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+static int
+dtsec_sysctl_sfp_txdis(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	int val = -1;
+	int error;
+
+	if (sc->sc_sfp_txdis == NULL)
+		return (ENXIO);
+
+	/* Read current state */
+	if (req->newptr == NULL) {
+		bool active;
+		gpio_pin_is_active(sc->sc_sfp_txdis, &active);
+		val = active ? 1 : 0;
+		return (sysctl_handle_int(oidp, &val, 0, req));
+	}
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error || req->newptr == NULL)
+		return (error);
+
+	gpio_pin_set_active(sc->sc_sfp_txdis, val != 0);
+	device_printf(sc->sc_dev, "TX_DISABLE manually %s\n",
+	    val ? "ASSERTED" : "DEASSERTED");
+
+	return (0);
 }
 
 static uint64_t
@@ -1129,8 +1960,10 @@ dtsec_attach(device_t dev)
 	/* Init callouts */
 	callout_init(&sc->sc_tick_callout, CALLOUT_MPSAFE);
 
-	/* Init SFP insert task */
+	/* Init SFP tasks */
 	TASK_INIT(&sc->sc_sfp_task, 0, dtsec_sfp_insert_task, sc);
+	TASK_INIT(&sc->sc_sfp_phy_task, 0, dtsec_sfp_phy_poll_task, sc);
+	TASK_INIT(&sc->sc_sfp_ddm_task, 0, dtsec_sfp_ddm_poll_task, sc);
 
 	/* Read configuraton */
 	if ((error = fman_get_handle(parent, &sc->sc_fmh)) != 0)
@@ -1285,6 +2118,16 @@ dtsec_attach(device_t dev)
 			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 			    sc, 0, dtsec_sysctl_sfp_info, "A",
 			    "SFP+ module vendor and part number");
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "sfp_phy",
+			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_sfp_phy, "A",
+			    "SFP+ embedded PHY info (10GBASE-T modules)");
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "sfp_txdis",
+			    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_sfp_txdis, "I",
+			    "Write 0/1 to deassert/assert TX_DISABLE");
 		}
 	}
 

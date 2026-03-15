@@ -153,6 +153,17 @@ struct dtsec_softc {
 	bool				sc_sfp_los_prev; /* previous LOS for edge detect */
 	uint8_t				sc_sfp_id[64];	/* EEPROM A0h base ID */
 	struct task			sc_sfp_task;	/* deferred insert handler */
+
+	/* SFP embedded PHY (10GBASE-T copper modules) */
+	bool				sc_sfp_has_phy;	/* PHY detected via I2C-MDIO */
+#define	DTSEC_SFP_PHY_ROLLBALL	1	/* RollBall protocol at 0x51 */
+#define	DTSEC_SFP_PHY_MDIOI2C	2	/* Standard I2C-MDIO at 0x56 */
+	int				sc_sfp_phy_proto; /* access protocol */
+	uint32_t			sc_sfp_phy_id;	/* PHY OUI+model from DEVID1/2 */
+	bool				sc_sfp_phy_link; /* PHY link status */
+	int				sc_sfp_phy_speed; /* negotiated speed (Mbps) */
+	struct task			sc_sfp_phy_task; /* deferred PHY poll */
+	struct task			sc_sfp_ddm_task; /* deferred DDM poll */
 };
 /** @} */
 
