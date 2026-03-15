@@ -49,6 +49,8 @@
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/openfirm.h>
 
+#include <sys/gpio.h>
+
 #include "miibus_if.h"
 #include "sff_if.h"
 
@@ -213,10 +215,16 @@ skip_phy:
 				gpio_pin_get_by_ofw_property(dev, sfp_node,
 				    "tx-disable-gpios", &sc->sc_sfp_txdis);
 
-				/* Hold TX disabled until module detected */
-				if (sc->sc_sfp_txdis != NULL)
+				/* Configure TX disable as output, hold asserted
+				 * until module detected.  Without setflags the
+				 * pin stays in INPUT mode and writes are
+				 * silently ignored. */
+				if (sc->sc_sfp_txdis != NULL) {
+					gpio_pin_setflags(sc->sc_sfp_txdis,
+					    GPIO_PIN_OUTPUT);
 					gpio_pin_set_active(sc->sc_sfp_txdis,
 					    true);
+				}
 
 				if (sc->sc_sfp_moddef0 != NULL)
 					device_printf(dev,
