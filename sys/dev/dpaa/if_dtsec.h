@@ -30,7 +30,6 @@
 #include "opt_dpaa.h"
 
 #include <sys/taskqueue.h>
-#include <dev/gpio/gpiobusvar.h>
 
 /**
  * @group dTSEC common API.
@@ -143,27 +142,13 @@ struct dtsec_softc {
 	volatile int			sc_ceetm_en;
 	uint32_t			sc_ceetm_dscp_fqid[64];
 
-	/* SFP module management (10G ports only) */
-	device_t			sc_sfp_dev;	/* sff driver instance */
-	device_t			sc_sfp_i2c;	/* I2C bus for EEPROM */
-	gpio_pin_t			sc_sfp_moddef0;	/* module detect GPIO */
-	gpio_pin_t			sc_sfp_los;	/* loss-of-signal GPIO */
-	gpio_pin_t			sc_sfp_txdis;	/* TX disable GPIO */
-	int				sc_sfp_modstate; /* 0=absent, 1=present */
-	bool				sc_sfp_los_prev; /* previous LOS for edge detect */
+	/* SFP module management (10G ports only, via sfp_fdt callbacks) */
+	device_t			sc_sfp_dev;	/* sfp_fdt driver instance */
+	device_t			sc_sfp_i2c;	/* I2C bus (for sysctl diag) */
 	uint8_t				sc_sfp_id[64];	/* EEPROM A0h base ID */
-	struct task			sc_sfp_task;	/* deferred insert handler */
-
-	/* SFP embedded PHY (10GBASE-T copper modules) */
-	bool				sc_sfp_has_phy;	/* PHY detected via I2C-MDIO */
-#define	DTSEC_SFP_PHY_ROLLBALL	1	/* RollBall protocol at 0x51 */
-#define	DTSEC_SFP_PHY_MDIOI2C	2	/* Standard I2C-MDIO at 0x56 */
-	int				sc_sfp_phy_proto; /* access protocol */
-	uint32_t			sc_sfp_phy_id;	/* PHY OUI+model from DEVID1/2 */
-	bool				sc_sfp_phy_link; /* PHY link status */
-	int				sc_sfp_phy_speed; /* negotiated speed (Mbps) */
-	struct task			sc_sfp_phy_task; /* deferred PHY poll */
-	struct task			sc_sfp_ddm_task; /* deferred DDM poll */
+	bool				sc_sfp_modpresent; /* module present */
+	bool				sc_sfp_phy_link; /* link state */
+	int				sc_sfp_phy_speed; /* speed in Mbps */
 };
 /** @} */
 
@@ -215,6 +200,14 @@ int		dtsec_miibus_readreg(device_t dev, int phy, int reg);
 int		dtsec_miibus_writereg(device_t dev, int phy, int reg,
 		    int value);
 void		dtsec_miibus_statchg(device_t dev);
+/** @} */
+
+/**
+ * @group SFP upstream callbacks.
+ * @{
+ */
+struct sfp_upstream_ops;
+extern const struct sfp_upstream_ops dtsec_sfp_ops;
 /** @} */
 
 #endif /* IF_DTSEC_H_ */
