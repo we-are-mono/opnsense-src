@@ -29,6 +29,9 @@
 
 #include "opt_dpaa.h"
 
+#include <sys/taskqueue.h>
+#include <dev/gpio/gpiobusvar.h>
+
 /**
  * @group dTSEC common API.
  * @{
@@ -139,6 +142,17 @@ struct dtsec_softc {
 	/* CEETM DSCP-based egress QoS (populated by CDX module) */
 	volatile int			sc_ceetm_en;
 	uint32_t			sc_ceetm_dscp_fqid[64];
+
+	/* SFP module management (10G ports only) */
+	device_t			sc_sfp_dev;	/* sff driver instance */
+	device_t			sc_sfp_i2c;	/* I2C bus for EEPROM */
+	gpio_pin_t			sc_sfp_moddef0;	/* module detect GPIO */
+	gpio_pin_t			sc_sfp_los;	/* loss-of-signal GPIO */
+	gpio_pin_t			sc_sfp_txdis;	/* TX disable GPIO */
+	int				sc_sfp_modstate; /* 0=absent, 1=present */
+	bool				sc_sfp_los_prev; /* previous LOS for edge detect */
+	uint8_t				sc_sfp_id[64];	/* EEPROM A0h base ID */
+	struct task			sc_sfp_task;	/* deferred insert handler */
 };
 /** @} */
 
