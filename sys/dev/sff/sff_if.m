@@ -26,10 +26,22 @@
 #
 
 #include <machine/bus.h>
+#include <dev/sff/sfp_fdt.h>
 
 INTERFACE sff;
 
 METHOD int get_i2c_bus {
 	device_t		 dev;
 	device_t		*i2c_bus;
+};
+
+#
+# Register upstream MAC driver to receive module/link event callbacks.
+# ops: function pointer table (sfp_upstream_ops from sfp_fdt.h)
+# arg: opaque context passed to each callback (typically MAC softc)
+#
+METHOD int register_upstream {
+	device_t			 dev;
+	const struct sfp_upstream_ops	*ops;
+	void				*arg;
 };

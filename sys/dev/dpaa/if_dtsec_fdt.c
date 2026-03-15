@@ -49,9 +49,9 @@
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/openfirm.h>
 
-#include <sys/gpio.h>
-
 #include "miibus_if.h"
+
+#include <dev/sff/sfp_fdt.h>
 #include "sff_if.h"
 
 #include <contrib/ncsw/inc/Peripherals/fm_port_ext.h>
@@ -186,52 +186,24 @@ dtsec_fdt_attach(device_t dev)
 	sc->sc_mdio = phy_dev;
 skip_phy:
 
-	/* Parse SFP phandle for 10G ports */
+	/* Register with SFP framework for 10G ports */
 	if (sc->sc_eth_dev_type == ETH_10GSEC) {
-		phandle_t sfp_xref, sfp_node;
+		phandle_t sfp_xref;
 		device_t sfp_dev;
 
 		if (OF_getencprop(enet_node, "sfp", &sfp_xref,
 		    sizeof(sfp_xref)) > 0) {
-			sfp_node = OF_node_from_xref(sfp_xref);
 			sfp_dev = OF_device_from_xref(sfp_xref);
 
 			if (sfp_dev != NULL) {
 				sc->sc_sfp_dev = sfp_dev;
 
-				/* Get I2C bus from sff driver */
-				if (SFF_GET_I2C_BUS(sfp_dev,
-				    &sc->sc_sfp_i2c) != 0) {
-					device_printf(dev,
-					    "SFP: failed to get I2C bus\n");
-					sc->sc_sfp_i2c = NULL;
-				}
+				/* Keep I2C bus handle for sysctl diag */
+				SFF_GET_I2C_BUS(sfp_dev, &sc->sc_sfp_i2c);
 
-				/* Acquire GPIOs from SFP DT node */
-				gpio_pin_get_by_ofw_property(dev, sfp_node,
-				    "mod-def0-gpios", &sc->sc_sfp_moddef0);
-				gpio_pin_get_by_ofw_property(dev, sfp_node,
-				    "los-gpios", &sc->sc_sfp_los);
-				gpio_pin_get_by_ofw_property(dev, sfp_node,
-				    "tx-disable-gpios", &sc->sc_sfp_txdis);
-
-				/* Configure TX disable as output, hold asserted
-				 * until module detected.  Without setflags the
-				 * pin stays in INPUT mode and writes are
-				 * silently ignored. */
-				if (sc->sc_sfp_txdis != NULL) {
-					gpio_pin_setflags(sc->sc_sfp_txdis,
-					    GPIO_PIN_OUTPUT);
-					gpio_pin_set_active(sc->sc_sfp_txdis,
-					    true);
-				}
-
-				if (sc->sc_sfp_moddef0 != NULL)
-					device_printf(dev,
-					    "SFP+ cage detected (GPIOs OK)\n");
-				else
-					device_printf(dev,
-					    "SFP: no mod-def0 GPIO\n");
+				/* Register to receive module/link events */
+				SFF_REGISTER_UPSTREAM(sfp_dev,
+				    &dtsec_sfp_ops, sc);
 			} else {
 				device_printf(dev,
 				    "SFP: sff driver not found\n");
