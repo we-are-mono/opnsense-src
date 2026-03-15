@@ -52,6 +52,8 @@
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/openfirm.h>
+#include <dev/iicbus/iic.h>
+#include <dev/iicbus/iiconf.h>
 
 #include "miibus_if.h"
 
@@ -78,6 +80,8 @@
 
 #define	DTSEC_MIN_FRAME_SIZE	64
 #define	DTSEC_MAX_FRAME_SIZE	9600
+
+static void	dtsec_sfp_poll(struct dtsec_softc *sc);
 
 #if (DPAA_VERSION < 11)
 #define	DTSEC_REG_MAXFRM	0x110
@@ -569,6 +573,8 @@ dtsec_if_tick(void *arg)
 	if (sc->sc_mii != NULL)
 		mii_tick(sc->sc_mii);
 
+	dtsec_sfp_poll(sc);
+
 	callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
 
 	DTSEC_UNLOCK(sc);
@@ -582,6 +588,7 @@ dtsec_if_deinit_locked(struct dtsec_softc *sc)
 
 	DTSEC_UNLOCK(sc);
 	callout_drain(&sc->sc_tick_callout);
+	taskqueue_drain(taskqueue_thread, &sc->sc_sfp_task);
 	DTSEC_LOCK(sc);
 }
 
@@ -659,6 +666,210 @@ dtsec_if_watchdog(if_t ifp)
 
 
 /**
+ * @group SFP module management.
+ * @{
+ */
+
+/* SFF-8024 connector types */
+#define	SFP_CONNECTOR_LC	0x07
+#define	SFP_CONNECTOR_RJ45	0x22	/* copper RJ45 */
+
+/* SFF-8472 EEPROM A0h field offsets */
+#define	SFP_ID_OFFSET		0
+#define	SFP_CONNECTOR_OFFSET	2
+#define	SFP_VENDOR_OFFSET	20
+#define	SFP_VENDOR_LEN		16
+#define	SFP_PARTNUM_OFFSET	40
+#define	SFP_PARTNUM_LEN		16
+
+/* I2C address for SFP EEPROM (A0h page, 7-bit) */
+#define	SFP_I2C_ADDR		0x50
+
+static int
+dtsec_sfp_read_eeprom(struct dtsec_softc *sc)
+{
+	struct iic_msg msgs[2];
+	uint8_t offset;
+	int error;
+
+	if (sc->sc_sfp_i2c == NULL)
+		return (ENXIO);
+
+	offset = 0;
+
+	/* Write offset byte */
+	msgs[0].slave = SFP_I2C_ADDR << 1;
+	msgs[0].flags = IIC_M_WR;
+	msgs[0].len = 1;
+	msgs[0].buf = &offset;
+
+	/* Read 64 bytes of base ID */
+	msgs[1].slave = SFP_I2C_ADDR << 1;
+	msgs[1].flags = IIC_M_RD;
+	msgs[1].len = sizeof(sc->sc_sfp_id);
+	msgs[1].buf = sc->sc_sfp_id;
+
+	/* sc_sfp_i2c is the iicbus device (from SFF_GET_I2C_BUS),
+	 * not a slave child, so use the bus-level API directly.
+	 * iicbus_request_bus(bus, owner, how) acquires exclusive access,
+	 * iicbus_transfer(bus, ...) routes to the controller. */
+	error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev,
+	    IIC_INTRWAIT);
+	if (error != 0) {
+		device_printf(sc->sc_dev,
+		    "SFP: failed to acquire I2C bus: %d\n", error);
+		return (error);
+	}
+
+	error = iicbus_transfer(sc->sc_sfp_i2c, msgs, 2);
+
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+	if (error != 0) {
+		device_printf(sc->sc_dev, "SFP EEPROM read failed: %d\n",
+		    error);
+		memset(sc->sc_sfp_id, 0, sizeof(sc->sc_sfp_id));
+	}
+
+	return (error);
+}
+
+static void
+dtsec_sfp_trim(char *dst, const uint8_t *src, int len)
+{
+	int i;
+
+	memcpy(dst, src, len);
+	dst[len] = '\0';
+	/* Trim trailing spaces */
+	for (i = len - 1; i >= 0 && dst[i] == ' '; i--)
+		dst[i] = '\0';
+}
+
+static void
+dtsec_sfp_log_module(struct dtsec_softc *sc)
+{
+	char vendor[SFP_VENDOR_LEN + 1];
+	char partnum[SFP_PARTNUM_LEN + 1];
+	uint8_t connector;
+
+	dtsec_sfp_trim(vendor, &sc->sc_sfp_id[SFP_VENDOR_OFFSET],
+	    SFP_VENDOR_LEN);
+	dtsec_sfp_trim(partnum, &sc->sc_sfp_id[SFP_PARTNUM_OFFSET],
+	    SFP_PARTNUM_LEN);
+	connector = sc->sc_sfp_id[SFP_CONNECTOR_OFFSET];
+
+	device_printf(sc->sc_dev,
+	    "SFP+ module inserted: %s %s (connector 0x%02x%s)\n",
+	    vendor, partnum, connector,
+	    connector == SFP_CONNECTOR_RJ45 ? " RJ45" : "");
+}
+
+static void
+dtsec_sfp_insert_task(void *arg, int pending)
+{
+	struct dtsec_softc *sc = arg;
+	bool present, los;
+
+	/* Read EEPROM (sleeps — runs in taskqueue thread context) */
+	dtsec_sfp_read_eeprom(sc);
+
+	/*
+	 * Take the lock to commit state atomically.  Re-check module
+	 * presence under lock — the poll callout may have already
+	 * processed a removal (modstate reset to 0) while we were
+	 * reading the EEPROM.  Only proceed if modstate is still -1
+	 * (probing, set by the poll that enqueued us).
+	 */
+	DTSEC_LOCK(sc);
+
+	if (sc->sc_sfp_modstate != -1) {
+		/* Module was removed while we were reading EEPROM */
+		DTSEC_UNLOCK(sc);
+		return;
+	}
+
+	/* Verify module is still physically present */
+	gpio_pin_is_active(sc->sc_sfp_moddef0, &present);
+	if (!present) {
+		sc->sc_sfp_modstate = 0;
+		memset(sc->sc_sfp_id, 0, sizeof(sc->sc_sfp_id));
+		DTSEC_UNLOCK(sc);
+		return;
+	}
+
+	/* Log module info */
+	if (sc->sc_sfp_id[SFP_ID_OFFSET] != 0)
+		dtsec_sfp_log_module(sc);
+
+	/* De-assert TX disable */
+	if (sc->sc_sfp_txdis != NULL)
+		gpio_pin_set_active(sc->sc_sfp_txdis, false);
+
+	sc->sc_sfp_modstate = 1;
+
+	/* Check initial LOS state */
+	if (sc->sc_sfp_los != NULL) {
+		gpio_pin_is_active(sc->sc_sfp_los, &los);
+		sc->sc_sfp_los_prev = los;
+		if (!los)
+			if_link_state_change(sc->sc_ifnet, LINK_STATE_UP);
+	} else {
+		/* No LOS GPIO — assume link up when module present */
+		sc->sc_sfp_los_prev = false;
+		if_link_state_change(sc->sc_ifnet, LINK_STATE_UP);
+	}
+
+	DTSEC_UNLOCK(sc);
+}
+
+static void
+dtsec_sfp_poll(struct dtsec_softc *sc)
+{
+	bool present, los;
+
+	DTSEC_LOCK_ASSERT(sc);
+
+	if (sc->sc_sfp_moddef0 == NULL)
+		return;
+
+	gpio_pin_is_active(sc->sc_sfp_moddef0, &present);
+
+	if (present && sc->sc_sfp_modstate == 0) {
+		/* Module just inserted — defer EEPROM read to thread.
+		 * Set modstate to -1 (probing) to prevent re-enqueue
+		 * on the next tick before the task completes. */
+		sc->sc_sfp_modstate = -1;
+		taskqueue_enqueue(taskqueue_thread, &sc->sc_sfp_task);
+		return;
+	}
+
+	if (!present && sc->sc_sfp_modstate != 0) {
+		/* Module removed */
+		if (sc->sc_sfp_txdis != NULL)
+			gpio_pin_set_active(sc->sc_sfp_txdis, true);
+		if_link_state_change(sc->sc_ifnet, LINK_STATE_DOWN);
+		sc->sc_sfp_modstate = 0;
+		sc->sc_sfp_los_prev = true;
+		memset(sc->sc_sfp_id, 0, sizeof(sc->sc_sfp_id));
+		device_printf(sc->sc_dev, "SFP+ module removed\n");
+		return;
+	}
+
+	/* Steady state — poll LOS for link changes */
+	if (sc->sc_sfp_modstate == 1 && sc->sc_sfp_los != NULL) {
+		gpio_pin_is_active(sc->sc_sfp_los, &los);
+		if (los != sc->sc_sfp_los_prev) {
+			sc->sc_sfp_los_prev = los;
+			if_link_state_change(sc->sc_ifnet,
+			    los ? LINK_STATE_DOWN : LINK_STATE_UP);
+		}
+	}
+}
+/** @} */
+
+
+/**
  * @group IFmedia routines.
  * @{
  */
@@ -686,8 +897,15 @@ dtsec_ifmedia_sts(if_t ifp, struct ifmediareq *ifmr)
 		mii_pollstat(sc->sc_mii);
 		ifmr->ifm_active = sc->sc_mii->mii_media_active;
 		ifmr->ifm_status = sc->sc_mii->mii_media_status;
+	} else if (sc->sc_sfp_moddef0 != NULL) {
+		/* SFP port with GPIO-based status */
+		ifmr->ifm_active = IFM_ETHER | IFM_10G_SR | IFM_FDX;
+		if (sc->sc_sfp_modstate != 0 && !sc->sc_sfp_los_prev)
+			ifmr->ifm_status = IFM_AVALID | IFM_ACTIVE;
+		else
+			ifmr->ifm_status = IFM_AVALID;
 	} else {
-		/* 10G port with no PHY — report fixed 10G media, always up */
+		/* 10G port with no SFP GPIOs — legacy always-up */
 		ifmr->ifm_active = IFM_ETHER | IFM_10G_SR | IFM_FDX;
 		ifmr->ifm_status = IFM_AVALID | IFM_ACTIVE;
 	}
@@ -819,6 +1037,32 @@ dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+static int
+dtsec_sysctl_sfp_info(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	char buf[48];
+
+	DTSEC_LOCK(sc);
+
+	if (sc->sc_sfp_modstate != 1) {
+		strlcpy(buf, "empty", sizeof(buf));
+	} else {
+		char vendor[SFP_VENDOR_LEN + 1];
+		char partnum[SFP_PARTNUM_LEN + 1];
+
+		dtsec_sfp_trim(vendor, &sc->sc_sfp_id[SFP_VENDOR_OFFSET],
+		    SFP_VENDOR_LEN);
+		dtsec_sfp_trim(partnum, &sc->sc_sfp_id[SFP_PARTNUM_OFFSET],
+		    SFP_PARTNUM_LEN);
+		snprintf(buf, sizeof(buf), "%s %s", vendor, partnum);
+	}
+
+	DTSEC_UNLOCK(sc);
+
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
 static uint64_t
 dtsec_get_counter(if_t ifp, ift_counter cnt)
 {
@@ -876,6 +1120,9 @@ dtsec_attach(device_t dev)
 
 	/* Init callouts */
 	callout_init(&sc->sc_tick_callout, CALLOUT_MPSAFE);
+
+	/* Init SFP insert task */
+	TASK_INIT(&sc->sc_sfp_task, 0, dtsec_sfp_insert_task, sc);
 
 	/* Read configuraton */
 	if ((error = fman_get_handle(parent, &sc->sc_fmh)) != 0)
@@ -1002,9 +1249,14 @@ dtsec_attach(device_t dev)
 	else
 		if_setbaudrate(ifp, IF_Gbps(1ULL));
 
-	/* 10G SFP+ direct-attach: link is always up (no PHY) */
-	if (sc->sc_phy_addr < 0)
-		if_link_state_change(ifp, LINK_STATE_UP);
+	/* 10G ports: SFP starts with link down (poll brings it up),
+	 * non-SFP assumes always up (legacy) */
+	if (sc->sc_phy_addr < 0) {
+		if (sc->sc_sfp_moddef0 != NULL)
+			if_link_state_change(ifp, LINK_STATE_DOWN);
+		else
+			if_link_state_change(ifp, LINK_STATE_UP);
+	}
 
 	/* Add diagnostic sysctls */
 	if (sc->sc_mode == DTSEC_MODE_REGULAR) {
@@ -1022,6 +1274,14 @@ dtsec_attach(device_t dev)
 		    "diag", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_diag, "I",
 		    "Write 1 to dump DQRR + BMan state to dmesg");
+
+		if (sc->sc_sfp_moddef0 != NULL) {
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "sfp_info",
+			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_sfp_info, "A",
+			    "SFP+ module vendor and part number");
+		}
 	}
 
 	return (0);
