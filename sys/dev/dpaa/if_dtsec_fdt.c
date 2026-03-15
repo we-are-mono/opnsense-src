@@ -50,6 +50,7 @@
 #include <dev/ofw/openfirm.h>
 
 #include "miibus_if.h"
+#include "sff_if.h"
 
 #include <contrib/ncsw/inc/Peripherals/fm_port_ext.h>
 #include <contrib/ncsw/inc/xx_ext.h>
@@ -93,6 +94,7 @@ DRIVER_MODULE(dtsec, fman, dtsec_driver, 0, 0);
 DRIVER_MODULE(miibus, dtsec, miibus_driver, 0, 0);
 MODULE_DEPEND(dtsec, ether, 1, 1, 1);
 MODULE_DEPEND(dtsec, miibus, 1, 1, 1);
+MODULE_DEPEND(dtsec, sff, 1, 1, 1);
 
 static int
 dtsec_fdt_probe(device_t dev)
@@ -181,6 +183,53 @@ dtsec_fdt_attach(device_t dev)
 
 	sc->sc_mdio = phy_dev;
 skip_phy:
+
+	/* Parse SFP phandle for 10G ports */
+	if (sc->sc_eth_dev_type == ETH_10GSEC) {
+		phandle_t sfp_xref, sfp_node;
+		device_t sfp_dev;
+
+		if (OF_getencprop(enet_node, "sfp", &sfp_xref,
+		    sizeof(sfp_xref)) > 0) {
+			sfp_node = OF_node_from_xref(sfp_xref);
+			sfp_dev = OF_device_from_xref(sfp_xref);
+
+			if (sfp_dev != NULL) {
+				sc->sc_sfp_dev = sfp_dev;
+
+				/* Get I2C bus from sff driver */
+				if (SFF_GET_I2C_BUS(sfp_dev,
+				    &sc->sc_sfp_i2c) != 0) {
+					device_printf(dev,
+					    "SFP: failed to get I2C bus\n");
+					sc->sc_sfp_i2c = NULL;
+				}
+
+				/* Acquire GPIOs from SFP DT node */
+				gpio_pin_get_by_ofw_property(dev, sfp_node,
+				    "mod-def0-gpios", &sc->sc_sfp_moddef0);
+				gpio_pin_get_by_ofw_property(dev, sfp_node,
+				    "los-gpios", &sc->sc_sfp_los);
+				gpio_pin_get_by_ofw_property(dev, sfp_node,
+				    "tx-disable-gpios", &sc->sc_sfp_txdis);
+
+				/* Hold TX disabled until module detected */
+				if (sc->sc_sfp_txdis != NULL)
+					gpio_pin_set_active(sc->sc_sfp_txdis,
+					    true);
+
+				if (sc->sc_sfp_moddef0 != NULL)
+					device_printf(dev,
+					    "SFP+ cage detected (GPIOs OK)\n");
+				else
+					device_printf(dev,
+					    "SFP: no mod-def0 GPIO\n");
+			} else {
+				device_printf(dev,
+				    "SFP: sff driver not found\n");
+			}
+		}
+	}
 
 	/* Get MAC memory offset in SoC */
 	rid = 0;
