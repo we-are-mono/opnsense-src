@@ -34,8 +34,15 @@ options 	TCP_SIGNATURE
 # Platform
 options 	SOC_NXP_LS
 
-# Root filesystem (label set by opnsense-build arm.sh)
-options 	ROOTDEVNAME=\"ufs:/dev/ufs/OPNsense_ARM\"
+# ZFS (compiled in -- no FreeBSD loader with booti)
+options 	ZFS
+
+# Root filesystem (ZFS pool "pool0")
+options 	ROOTDEVNAME=\"zfs:pool0/ROOT/default\"
+
+# Disable diskid labels so GPT labels (/dev/gpt/*) work with ZFS
+# (diskid provider prevents GPT from attaching to the raw device)
+envvar		kern.geom.label.disk_ident.enable="0"
 
 # Early printf for debugging
 options 	SOCDEV_PA=0x2000000

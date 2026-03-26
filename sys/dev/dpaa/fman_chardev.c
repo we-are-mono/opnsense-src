@@ -1606,7 +1606,6 @@ fmcd_pcd_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		/* HC is already configured by fman.c — just accept */
 		return (0);
 	default:
-		printf("fmcd: unknown PCD ioctl 0x%lx\n", cmd);
 		return (ENOTTY);
 	}
 }
@@ -1624,7 +1623,6 @@ fmcd_fm_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	case FM_IOC_GET_API_VERSION:
 		return (fmcd_ioc_get_api_version(sc, data));
 	default:
-		printf("fmcd: unknown FM ioctl 0x%lx\n", cmd);
 		return (ENOTTY);
 	}
 }
@@ -1654,7 +1652,6 @@ fmcd_port_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	case FM_PORT_IOC_DISABLE:
 		return (fmcd_ioc_port_disable(sc, h_port));
 	default:
-		printf("fmcd: unknown PORT ioctl 0x%lx\n", cmd);
 		return (ENOTTY);
 	}
 }
