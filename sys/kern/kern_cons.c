@@ -62,7 +62,11 @@
 #include <sys/reboot.h>
 #include <sys/sysctl.h>
 #include <sys/sbuf.h>
+#include <sys/time.h>
 #include <sys/tslog.h>
+#ifdef __aarch64__
+#include <machine/armreg.h>
+#endif
 #include <sys/tty.h>
 #include <sys/uio.h>
 #include <sys/vnode.h>
@@ -496,6 +500,94 @@ cngets(char *cp, size_t size, int visible)
 	}
 }
 
+static bool cn_ts_newline = true;
+static bool cn_ts_emitting;
+
+/*
+ * Emit a raw string directly to all console hardware, bypassing cnputc
+ * to avoid recursion.  Handles \n → \r\n translation.
+ */
+static void
+cn_puts_raw(const char *s)
+{
+	struct cn_device *cnd;
+	struct consdev *cn;
+
+	for (; *s != '\0'; s++) {
+		STAILQ_FOREACH(cnd, &cn_devlist, cnd_next) {
+			cn = cnd->cnd_cn;
+			if (!kdb_active ||
+			    !(cn->cn_flags & CN_FLAG_NODEBUG))
+				cn->cn_ops->cn_putc(cn, *s);
+		}
+	}
+}
+
+/*
+ * Get uptime in seconds + microseconds.  On arm64, read the generic timer
+ * directly (cntvct_el0 / cntfrq_el0) so timestamps work from the very
+ * first instruction, before timecounters are initialized.
+ */
+static void
+cn_get_uptime(long *sec, int *usec)
+{
+#ifdef __aarch64__
+	static uint64_t cn_ts_freq;
+	uint64_t cnt, s, rem;
+
+	if (__predict_false(cn_ts_freq == 0))
+		cn_ts_freq = READ_SPECIALREG(cntfrq_el0);
+	cnt = READ_SPECIALREG(cntvct_el0);
+	s = cnt / cn_ts_freq;
+	rem = cnt % cn_ts_freq;
+	*sec = (long)s;
+	*usec = (int)(rem * 1000000 / cn_ts_freq);
+#else
+	struct timeval tv;
+
+	microuptime(&tv);
+	*sec = (long)tv.tv_sec;
+	*usec = (int)tv.tv_usec;
+#endif
+}
+
+/*
+ * Format a colored timestamp prefix into buf: [    0.000132]
+ * Brackets are default color, the number is green.
+ */
+static void
+cn_format_timestamp(char *buf, size_t len)
+{
+	long sec;
+	int usec;
+
+	cn_get_uptime(&sec, &usec);
+	snprintf(buf, len,
+	    "\033[0m[\033[34m%5ld.%06d\033[0m] ", sec, usec);
+}
+
+static void
+cn_emit_timestamp(void)
+{
+	char buf[48];
+
+	cn_format_timestamp(buf, sizeof(buf));
+	cn_puts_raw(buf);
+}
+
+#ifdef EARLY_PRINTF
+static void
+cn_emit_timestamp_early(void)
+{
+	char buf[48];
+	const char *s;
+
+	cn_format_timestamp(buf, sizeof(buf));
+	for (s = buf; *s != '\0'; s++)
+		early_putc(*s);
+}
+#endif
+
 void
 cnputc(int c)
 {
@@ -505,8 +597,17 @@ cnputc(int c)
 
 #ifdef EARLY_PRINTF
 	if (early_putc != NULL) {
-		if (c == '\n')
+		if (cn_ts_newline && !cn_ts_emitting &&
+		    c != '\n' && c != '\r' && c != '\0') {
+			cn_ts_emitting = true;
+			cn_emit_timestamp_early();
+			cn_ts_emitting = false;
+			cn_ts_newline = false;
+		}
+		if (c == '\n') {
 			early_putc('\r');
+			cn_ts_newline = true;
+		}
 		early_putc(c);
 		return;
 	}
@@ -514,6 +615,15 @@ cnputc(int c)
 
 	if (cn_mute || c == '\0')
 		return;
+
+	if (cn_ts_newline && !cn_ts_emitting &&
+	    c != '\n' && c != '\r') {
+		cn_ts_emitting = true;
+		cn_emit_timestamp();
+		cn_ts_emitting = false;
+		cn_ts_newline = false;
+	}
+
 	STAILQ_FOREACH(cnd, &cn_devlist, cnd_next) {
 		cn = cnd->cnd_cn;
 		if (!kdb_active || !(cn->cn_flags & CN_FLAG_NODEBUG)) {
@@ -522,6 +632,10 @@ cnputc(int c)
 			cn->cn_ops->cn_putc(cn, c);
 		}
 	}
+
+	if (c == '\n')
+		cn_ts_newline = true;
+
 	if (console_pausing && c == '\n' && !kdb_active) {
 		for (cp = console_pausestr; *cp != '\0'; cp++)
 			cnputc(*cp);
