@@ -40,6 +40,9 @@ options 	ZFS
 # Root filesystem (ZFS pool "pool0")
 options 	ROOTDEVNAME=\"zfs:pool0/ROOT/default\"
 
+# U-Boot (build booti compatible kernel)
+options 	LINUX_BOOT_ABI
+
 # Disable diskid labels so GPT labels (/dev/gpt/*) work with ZFS
 # (diskid provider prevents GPT from attaching to the raw device)
 envvar		kern.geom.label.disk_ident.enable="0"
