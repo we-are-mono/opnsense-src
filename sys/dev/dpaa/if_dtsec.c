@@ -46,6 +46,7 @@
 #include <net/if_media.h>
 #include <net/if_types.h>
 #include <net/if_arp.h>
+#include <net/if_var.h>
 
 #include <dev/mii/mii.h>
 #include <dev/mii/miivar.h>
@@ -488,6 +489,44 @@ dtsec_if_disable_locked(struct dtsec_softc *sc)
 }
 
 static int
+dtsec_if_sfp_i2c_read(struct dtsec_softc *sc, struct ifi2creq *req)
+{
+	struct iic_msg msgs[2];
+	uint8_t reg;
+	int error;
+
+	if (sc->sc_sfp_i2c == NULL || sc->sc_sfp_dev == NULL)
+		return (ENXIO);
+	if (!sc->sc_sfp_modpresent)
+		return (ENXIO);
+	if (req->len == 0 || req->len > sizeof(req->data))
+		return (EINVAL);
+	if (req->dev_addr != 0xA0 && req->dev_addr != 0xA2)
+		return (EINVAL);
+
+	reg = req->offset;
+
+	msgs[0].slave = req->dev_addr;
+	msgs[0].flags = IIC_M_WR;
+	msgs[0].len = 1;
+	msgs[0].buf = &reg;
+
+	msgs[1].slave = req->dev_addr;
+	msgs[1].flags = IIC_M_RD;
+	msgs[1].len = req->len;
+	msgs[1].buf = req->data;
+
+	error = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev, IIC_INTRWAIT);
+	if (error != 0)
+		return (error);
+
+	error = iicbus_transfer(sc->sc_sfp_i2c, msgs, 2);
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+
+	return (error);
+}
+
+static int
 dtsec_if_ioctl(if_t ifp, u_long command, caddr_t data)
 {
 	struct dtsec_softc *sc;
@@ -528,6 +567,27 @@ dtsec_if_ioctl(if_t ifp, u_long command, caddr_t data)
 			error = ENOTTY;
 		break;
 
+	case SIOCGI2C: {
+		struct ifi2creq req;
+		void *uptr;
+
+		uptr = ifr_data_get_ptr(ifr);
+		if (uptr == NULL) {
+			error = EINVAL;
+			break;
+		}
+
+		error = copyin(uptr, &req, sizeof(req));
+		if (error != 0)
+			break;
+
+		error = dtsec_if_sfp_i2c_read(sc, &req);
+		if (error != 0)
+			break;
+
+		error = copyout(&req, uptr, sizeof(req));
+		break;
+	}
 	case SIOCSIFCAP: {
 		int mask;
 
