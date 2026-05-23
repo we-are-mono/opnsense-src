@@ -708,6 +708,11 @@ dtsec_sfp_link_up(void *arg, int speed)
 
 	sc->sc_sfp_phy_link = true;
 	sc->sc_sfp_phy_speed = speed;
+
+	if (sc->sc_mach != NULL &&
+	    ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_1000)
+		FM_MAC_AdjustLink(sc->sc_mach, e_ENET_SPEED_1000, true);
+
 	if_link_state_change(sc->sc_ifnet, LINK_STATE_UP);
 }
 
@@ -772,7 +777,14 @@ dtsec_ifmedia_sts(if_t ifp, struct ifmediareq *ifmr)
 			default:    ifmr->ifm_active |= IFM_10G_T; break;
 			}
 		} else {
-			ifmr->ifm_active |= IFM_10G_SR;
+			/*
+			 * TODO: reporting is not yet complete for 1G nor 10G.
+			 */
+			if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) ==
+			    e_ENET_SPEED_1000)
+				ifmr->ifm_active |= IFM_1000_SX;
+			else
+				ifmr->ifm_active |= IFM_10G_SR;
 		}
 		if (sc->sc_sfp_phy_link)
 			ifmr->ifm_status = IFM_AVALID | IFM_ACTIVE;
@@ -1172,7 +1184,7 @@ dtsec_attach(device_t dev)
 	ether_ifattach(ifp, sc->sc_mac_addr);
 
 	/* Set baudrate */
-	if (sc->sc_eth_dev_type == ETH_10GSEC)
+	if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_10000)
 		if_setbaudrate(ifp, IF_Gbps(10ULL));
 	else
 		if_setbaudrate(ifp, IF_Gbps(1ULL));

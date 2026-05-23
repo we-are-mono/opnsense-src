@@ -122,6 +122,7 @@ dtsec_fdt_attach(device_t dev)
 	device_t phy_dev;
 	phandle_t enet_node, phy_node;
 	phandle_t fman_rxtx_node[2];
+	phandle_t sfp_xref;
 	char phy_type[16];
 	pcell_t fman_tx_cell, mac_id;
 	int rid;
@@ -158,8 +159,10 @@ dtsec_fdt_attach(device_t dev)
 	/* Get PHY address */
 	if (OF_getencprop(enet_node, "phy-handle", (void *)&phy_node,
 	    sizeof(phy_node)) <= 0) {
-		/* 10G ports may use managed="in-band-status" with no PHY */
-		if (sc->sc_eth_dev_type == ETH_10GSEC) {
+		/* SFP/SFP+ ports may use managed="in-band-status" with no PHY */
+		if (sc->sc_eth_dev_type == ETH_10GSEC ||
+		    OF_getencprop(enet_node, "sfp", &sfp_xref,
+		    sizeof(sfp_xref)) > 0) {
 			sc->sc_phy_addr = -1;
 			sc->sc_mdio = NULL;
 			goto skip_phy;
@@ -186,9 +189,8 @@ dtsec_fdt_attach(device_t dev)
 	sc->sc_mdio = phy_dev;
 skip_phy:
 
-	/* Register with SFP framework for 10G ports */
-	if (sc->sc_eth_dev_type == ETH_10GSEC) {
-		phandle_t sfp_xref;
+	/* Register with SFP framework for SFP ports */
+	if (true) {
 		device_t sfp_dev;
 
 		if (OF_getencprop(enet_node, "sfp", &sfp_xref,
@@ -228,6 +230,8 @@ skip_phy:
 
 	if (!strcmp(phy_type, "sgmii"))
 		sc->sc_mac_enet_mode = e_ENET_MODE_SGMII_1000;
+	else if (!strcmp(phy_type, "1000base-x"))
+		sc->sc_mac_enet_mode = e_ENET_MODE_SGMII_BASEX_1000;
 	else if (!strcmp(phy_type, "rgmii"))
 		sc->sc_mac_enet_mode = e_ENET_MODE_RGMII_1000;
 	else if (!strcmp(phy_type, "xgmii"))
@@ -250,8 +254,10 @@ skip_phy:
 	/* ncsw expects 0-based per-type MAC IDs: 0..5 for 1G, 0..1 for 10G.
 	 * FManV3 device trees use cell-index 0-5 for 1G MACs but 8-9 for
 	 * 10G MACs (hardware MEMAC slot numbering).  Remap to 0-based. */
-	if (sc->sc_eth_dev_type == ETH_10GSEC && mac_id >= 8)
+	if (mac_id >= 8) {
+		sc->sc_eth_dev_type = ETH_10GSEC;
 		sc->sc_eth_id = mac_id - 8;
+	}
 
 	/* Get RX/TX port handles */
 	if (OF_getencprop(enet_node, "fsl,fman-ports", (void *)fman_rxtx_node,
