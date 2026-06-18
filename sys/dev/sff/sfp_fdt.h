@@ -56,7 +56,25 @@ struct sfp_upstream_ops {
 	 * Link went down.
 	 */
 	void	(*link_down)(void *arg);
+
+	/*
+	 * Embedded PHY capabilities discovered (copper modules).  modes is a
+	 * bitmask of SFP_MODE_*.  Called once after the PHY is probed; not
+	 * called for fiber/DAC modules (which have no MDIO PHY).
+	 */
+	void	(*phy_modes)(void *arg, uint32_t modes);
 };
+
+/*
+ * Supported BASE-T link modes for copper RJ45 modules (phy_modes bitmask).
+ * EXTABLE exposes a single NBASE-T bit covering both 2.5G and 5G, so those
+ * two are reported together unless a finer per-rate read is added.
+ */
+#define	SFP_MODE_100_T		(1 << 0)	/* 100BASE-TX  */
+#define	SFP_MODE_1000_T		(1 << 1)	/* 1000BASE-T  */
+#define	SFP_MODE_2500_T		(1 << 2)	/* 2.5GBASE-T  */
+#define	SFP_MODE_5000_T		(1 << 3)	/* 5GBASE-T    */
+#define	SFP_MODE_10G_T		(1 << 4)	/* 10GBASE-T   */
 
 /* SFF-8024 connector types */
 #define	SFP_CONNECTOR_LC	0x07

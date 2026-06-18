@@ -157,6 +157,7 @@ struct sfp_fdt_softc {
 	uint32_t	sc_phy_id;
 	bool		sc_phy_link;
 	int		sc_phy_speed;
+	uint32_t	sc_phy_modes;	/* SFP_MODE_* bitmask */
 	int		sc_phy_retries;
 
 	/* Fiber/DAC LOS tracking */
@@ -687,6 +688,16 @@ sfp_fdt_notify_link_down(struct sfp_fdt_softc *sc)
 		sc->sc_upstream_ops->link_down(sc->sc_upstream_arg);
 }
 
+static void
+sfp_fdt_notify_phy_modes(struct sfp_fdt_softc *sc)
+{
+
+	if (sc->sc_upstream_ops != NULL &&
+	    sc->sc_upstream_ops->phy_modes != NULL)
+		sc->sc_upstream_ops->phy_modes(sc->sc_upstream_arg,
+		    sc->sc_phy_modes);
+}
+
 /*
  * ============================================================
  * State machine transitions
@@ -829,6 +840,17 @@ sfp_fdt_sm_phy_probe(struct sfp_fdt_softc *sc)
 
 	extable = sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_PMA_EXTABLE);
 	if (extable >= 0) {
+		uint32_t modes = 0;
+
+		if (extable & MDIO_PMA_EXTABLE_10GBT)
+			modes |= SFP_MODE_10G_T;
+		if (extable & MDIO_PMA_EXTABLE_1000BT)
+			modes |= SFP_MODE_1000_T;
+		/* EXTABLE has one NBASE-T bit covering both 2.5G and 5G. */
+		if (extable & MDIO_PMA_EXTABLE_NBT)
+			modes |= SFP_MODE_2500_T | SFP_MODE_5000_T;
+		sc->sc_phy_modes = modes;
+
 		device_printf(sc->sc_dev,
 		    "SFP+ PHY abilities: %s%s%s\n",
 		    (extable & MDIO_PMA_EXTABLE_10GBT) ? "10GBASE-T " : "",
@@ -840,6 +862,8 @@ sfp_fdt_sm_phy_probe(struct sfp_fdt_softc *sc)
 	sc->sc_has_phy = true;
 	sc->sc_phy_link = false;
 	sc->sc_phy_speed = 0;
+
+	sfp_fdt_notify_phy_modes(sc);
 
 	sfp_phy_config_aneg(sc);
 
@@ -1015,6 +1039,7 @@ sfp_fdt_sm_remove(struct sfp_fdt_softc *sc)
 	sc->sc_phy_id = 0;
 	sc->sc_phy_link = false;
 	sc->sc_phy_speed = 0;
+	sc->sc_phy_modes = 0;
 	sc->sc_los_prev = true;
 	memset(sc->sc_id, 0, sizeof(sc->sc_id));
 
