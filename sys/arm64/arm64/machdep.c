@@ -134,7 +134,7 @@ int early_boot = 1;
 int cold = 1;
 static int boot_el;
 uintptr_t socdev_va;
-static uint64_t hcr_el2;
+static uint64_t hcr_el2 __unused;
 
 struct kva_md_info kmi;
 
