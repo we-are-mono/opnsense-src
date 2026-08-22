@@ -33,11 +33,12 @@ options 	TCP_SIGNATURE
 # Platform
 options 	SOC_NXP_LS
 
-# ZFS (compiled in -- no FreeBSD loader with booti)
-options 	ZFS
-
-# Root filesystem (ZFS pool "pool0")
-options 	ROOTDEVNAME=\"zfs:pool0/ROOT/default\"
+# Root filesystem (UFS, labeled ufs/OPNsense_ARM by the arm-5G build --
+# compiled in as ROOTDEVNAME since booti bypasses FreeBSD's own loader,
+# so there's no /boot/loader.conf or /etc/fstab auto-detection available
+# at boot time; the kernel needs this baked in to mount root without any
+# manual bootargs/mountroot intervention.)
+options		ROOTDEVNAME=\"ufs:/dev/ufs/OPNsense_ARM\"
 
 # U-Boot (build booti compatible kernel)
 options 	LINUX_BOOT_ABI
