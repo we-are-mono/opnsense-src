@@ -554,6 +554,16 @@ dtsec_if_ioctl(if_t ifp, u_long command, caddr_t data)
 				if_sethwassist(ifp, if_gethwassist(ifp) &
 				    ~(CSUM_IP6_TCP | CSUM_IP6_UDP));
 		}
+		/*
+		 * RX checksum is validated in hardware by the FMan parser;
+		 * there's no separate enable/disable knob to program here.
+		 * Just track the flag so the receive path (if_dtsec_rm.c)
+		 * knows whether to trust and report the hardware result.
+		 */
+		if (mask & IFCAP_RXCSUM)
+			if_togglecapenable(ifp, IFCAP_RXCSUM);
+		if (mask & IFCAP_RXCSUM_IPV6)
+			if_togglecapenable(ifp, IFCAP_RXCSUM_IPV6);
 		break;
 	}
 

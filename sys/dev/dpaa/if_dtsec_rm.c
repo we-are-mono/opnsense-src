@@ -797,17 +797,28 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 	m->m_len = DPAA_FD_GET_LENGTH(frame);
 	m->m_pkthdr.len = m->m_len;
 
-	/* Extract RX checksum result from parse result in buffer prefix */
-	if (sc->sc_rx_data_offset > 0) {
+	/*
+	 * Extract RX checksum result from parse result in buffer prefix,
+	 * but only if the matching RX checksum capability is enabled -
+	 * otherwise leave csum_flags untouched so the stack verifies in
+	 * software, same as toggling the GUI checkbox off should mean.
+	 */
+	if (sc->sc_rx_data_offset > 0 &&
+	    (if_getcapenable(sc->sc_ifnet) &
+	    (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6))) {
 		t_FmPrsResult *prs;
 
 		prs = FM_PORT_GetBufferPrsResult(sc->sc_rxph,
 		    (char *)frame_va);
 		if (prs != NULL) {
 			uint16_t l3r = be16toh(prs->l3r);
+			int cap_ok =
+			    ((l3r & FM_L3_PARSE_RESULT_IPV4) &&
+			    (if_getcapenable(sc->sc_ifnet) & IFCAP_RXCSUM)) ||
+			    ((l3r & FM_L3_PARSE_RESULT_IPV6) &&
+			    (if_getcapenable(sc->sc_ifnet) & IFCAP_RXCSUM_IPV6));
 
-			if (l3r & (FM_L3_PARSE_RESULT_IPV4 |
-			    FM_L3_PARSE_RESULT_IPV6)) {
+			if (cap_ok) {
 				m->m_pkthdr.csum_flags |=
 				    CSUM_L3_CALC | CSUM_L3_VALID;
 
