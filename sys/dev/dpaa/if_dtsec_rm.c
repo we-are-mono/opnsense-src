@@ -55,7 +55,10 @@
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
 #include <netinet/ip.h>
+#include <netinet/ip_var.h>
 #include <netinet/ip6.h>
+#include <netinet6/ip6_var.h>
+#include <netinet/tcp.h>
 #include <machine/in_cksum.h>
 
 #include <contrib/ncsw/inc/integrations/dpaa_integration_ext.h>
@@ -1415,6 +1418,73 @@ dtsec_rm_tx_csum_fill(struct dtsec_softc *sc, struct mbuf *m,
 }
 
 /**
+ * Software checksum fallback for frames hardware can't offload.
+ * Returns 0 if handled, non-zero if the caller should drop the frame
+ * instead of sending it with an unfinished checksum.
+ */
+static int
+dtsec_rm_tx_csum_software(struct mbuf *m0)
+{
+	struct ether_header *eh;
+	uint16_t et;
+	int ehl;
+
+	if (m0->m_len < (int)sizeof(*eh))
+		return (EINVAL);
+
+	eh = mtod(m0, struct ether_header *);
+	et = ntohs(eh->ether_type);
+	ehl = sizeof(*eh) + (et == ETHERTYPE_VLAN ? 4 : 0);
+	if (et == ETHERTYPE_VLAN) {
+		if (m0->m_len < (int)sizeof(*eh) + 4)
+			return (EINVAL);
+		et = ntohs(*(uint16_t *)((char *)eh + sizeof(*eh) + 2));
+	}
+
+	if (et == ETHERTYPE_IP &&
+	    m0->m_pkthdr.csum_flags &
+	    (CSUM_DELAY_DATA | CSUM_TCP | CSUM_UDP |
+	     CSUM_IP_TCP | CSUM_IP_UDP)) {
+		in_delayed_cksum_o(m0, ehl);
+		m0->m_pkthdr.csum_flags &=
+		    ~(CSUM_DELAY_DATA | CSUM_TCP | CSUM_UDP |
+		    CSUM_IP_TCP | CSUM_IP_UDP);
+	} else if (et == ETHERTYPE_IPV6 &&
+	    m0->m_pkthdr.csum_flags &
+	    (CSUM_DELAY_DATA_IPV6 | CSUM_TCP_IPV6 |
+	     CSUM_UDP_IPV6 | CSUM_IP6_TCP | CSUM_IP6_UDP)) {
+		struct ip6_hdr *ip6;
+
+		if (m0->m_pkthdr.len < ehl + (int)sizeof(*ip6))
+			return (EINVAL);
+		ip6 = (struct ip6_hdr *)(mtod(m0, char *) + ehl);
+
+		/* Extension headers would shift the real L4 offset. */
+		if (ip6->ip6_nxt != IPPROTO_TCP && ip6->ip6_nxt != IPPROTO_UDP)
+			return (EINVAL);
+		in6_delayed_cksum(m0,
+		    m0->m_pkthdr.len - ehl - sizeof(struct ip6_hdr),
+		    ehl + sizeof(struct ip6_hdr));
+		m0->m_pkthdr.csum_flags &=
+		    ~(CSUM_DELAY_DATA_IPV6 | CSUM_TCP_IPV6 |
+		    CSUM_UDP_IPV6 | CSUM_IP6_TCP | CSUM_IP6_UDP);
+	}
+
+	/* Stack left ip_sum=0 relying on CSUM_IP; fill it in now. */
+	if (et == ETHERTYPE_IP && (m0->m_pkthdr.csum_flags & CSUM_IP)) {
+		struct ip *ip2;
+
+		if (m0->m_len < ehl + (int)sizeof(*ip2))
+			return (EINVAL);
+		ip2 = (struct ip *)(mtod(m0, char *) + ehl);
+		ip2->ip_sum = 0;
+		ip2->ip_sum = in_cksum_hdr(ip2);
+	}
+	m0->m_pkthdr.csum_flags = 0;
+	return (0);
+}
+
+/**
  * @group dTSEC IFnet routines.
  * @{
  */
@@ -1536,31 +1606,32 @@ dtsec_rm_if_transmit(if_t ifp, struct mbuf *m0)
 		t_FmPrsResult prs;
 		t_FmPrsResult *buf_prs;
 
-		/* Fill parse result for hardware checksum */
+		/*
+		 * Fill parse result for hardware checksum.  A forwarded/
+		 * NAT'd packet's headers aren't always contiguous in the
+		 * first mbuf, so pull up and retry once before falling back.
+		 */
 		if (dtsec_rm_tx_csum_fill(sc, m0, &prs) != 0) {
-			/* Can't offload L4 (e.g. ICMP) — compute
-			 * IP header checksum in software since the
-			 * stack left ip_sum=0 relying on CSUM_IP. */
-			if (m0->m_pkthdr.csum_flags & CSUM_IP) {
-				struct ether_header *eh2;
-				struct ip *ip2;
-				uint16_t et;
-				int ehl;
-
-				eh2 = mtod(m0, struct ether_header *);
-				et = ntohs(eh2->ether_type);
-				ehl = sizeof(*eh2);
-				if (et == ETHERTYPE_VLAN)
-					ehl += 4;
-				if (m0->m_len >= ehl + (int)sizeof(*ip2)) {
-					ip2 = (struct ip *)
-					    (mtod(m0, char *) + ehl);
-					ip2->ip_sum = 0;
-					ip2->ip_sum = in_cksum_hdr(ip2);
-				}
+			m0 = m_pullup(m0, MIN(m0->m_pkthdr.len,
+			    sizeof(struct ether_vlan_header) +
+			    sizeof(struct ip6_hdr) + sizeof(struct tcphdr)));
+			if (m0 == NULL) {
+				sched_unpin();
+				dtsec_rm_fi_free(sc, fi);
+				if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+				return (ENOBUFS);
 			}
-			m0->m_pkthdr.csum_flags = 0;
-			goto tx_sg_path;
+			if (dtsec_rm_tx_csum_fill(sc, m0, &prs) != 0) {
+				if (dtsec_rm_tx_csum_software(m0) != 0) {
+					sched_unpin();
+					dtsec_rm_fi_free(sc, fi);
+					m_freem(m0);
+					if_inc_counter(ifp,
+					    IFCOUNTER_OERRORS, 1);
+					return (EIO);
+				}
+				goto tx_sg_path;
+			}
 		}
 
 		/* Allocate SG table buffer: [prefix | SG entries] */
