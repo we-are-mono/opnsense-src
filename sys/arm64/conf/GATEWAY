@@ -47,6 +47,10 @@ options 	LINUX_BOOT_ABI
 # (diskid provider prevents GPT from attaching to the raw device)
 envvar		kern.geom.label.disk_ident.enable="0"
 
+# booti skips loader(8), so RDTUN sysctls like this one can only be
+# set here. Use all 4 cores for netisr instead of the 1-thread default.
+envvar		net.isr.maxthreads="-1"
+
 # Early printf for debugging
 options 	SOCDEV_PA=0x2000000
 options 	EARLY_PRINTF=qoriq
