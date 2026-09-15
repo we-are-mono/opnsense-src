@@ -931,7 +931,7 @@ ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
 
 	if (FmPcdHcSync(info->pcd)) {
 		printf("fm_ehash: FmPcdHcSync failed in DeleteKey\n");
-		return (-1);
+		return (EN_EHASH_DELETE_UNSYNCED);
 	}
 
 	return (0);
