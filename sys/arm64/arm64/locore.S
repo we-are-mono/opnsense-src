@@ -768,7 +768,10 @@ common:
 	/* Map FDT data ? */
 	cbz	x19, 1f
 
-	/* Create the mapping for FDT data (2 MiB max) */
+	/*
+	 * Create the mapping for FDT data (2 MiB max). Map two blocks since
+	 * the FDT may cross a 2 MiB boundary.
+	 */
 	mov	x7, #(ATTR_S1_nG | ATTR_S1_IDX(VM_MEMATTR_WRITE_BACK))
 	ldr	x9, =(L2_SIZE)
 	add	x16, x16, x9	/* VA start */
@@ -778,7 +781,7 @@ common:
 	and	x0, x0, #(L2_OFFSET)	/* Keep the lower bits */
 	add	x0, x0, x8		/* Add the aligned virtual address */
 
-	mov	x10, #1
+	mov	x10, #2
 	bl	build_l2_block_pagetable
 
 1:
