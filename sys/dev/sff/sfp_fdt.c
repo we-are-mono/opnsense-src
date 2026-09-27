@@ -79,6 +79,7 @@
 #define	MDIO_DEVID1		2
 #define	MDIO_DEVID2		3
 #define	MDIO_PMA_EXTABLE	11
+#define	MDIO_PMA_NG_EXTABLE	21
 #define	MDIO_AN_10GBT_CTRL	32
 #define	MDIO_AN_10GBT_STAT	33
 
@@ -97,6 +98,14 @@
 #define	MDIO_PMA_EXTABLE_10GBT		(1 << 2)
 #define	MDIO_PMA_EXTABLE_1000BT	(1 << 5)
 #define	MDIO_PMA_EXTABLE_NBT		(1 << 14)
+
+/* PMA NG_EXTABLE (2.5G/5G extended ability) bits */
+#define	MDIO_PMA_NG_EXTABLE_2_5GBT	(1 << 0)
+#define	MDIO_PMA_NG_EXTABLE_5GBT	(1 << 1)
+
+/* PMA CTRL1 speed select: bit 13 alone means 100M */
+#define	MDIO_PMA_CTRL1_SPEEDSEL		((1 << 13) | (1 << 6) | (0xf << 2))
+#define	MDIO_PMA_CTRL1_SPEED100		(1 << 13)
 
 /* AN 10GBT_CTRL advertisement bits */
 #define	MDIO_AN_10GBT_CTRL_ADV10G	(1 << 12)
@@ -157,6 +166,7 @@ struct sfp_fdt_softc {
 	uint32_t	sc_phy_id;
 	bool		sc_phy_link;
 	int		sc_phy_speed;
+	uint32_t	sc_phy_modes;	/* SFP_MODE_* bitmask */
 	int		sc_phy_retries;
 
 	/* Fiber/DAC LOS tracking */
@@ -307,7 +317,17 @@ sfp_fdt_log_module(struct sfp_fdt_softc *sc)
 	device_printf(sc->sc_dev,
 	    "SFP+ module: %s %s (connector 0x%02x%s)\n",
 	    vendor, partnum, connector,
-	    connector == SFP_CONNECTOR_RJ45 ? " RJ45" : "");
+	    connector == SFP_CONNECTOR_RJ45 ? " RJ45" :
+	    connector == SFP_CONNECTOR_COPPER_PIGTAIL ? " DAC" : "");
+}
+
+/* Name for link messages on LOS-based modules: DAC cable or fiber. */
+static const char *
+sfp_fdt_los_kind(struct sfp_fdt_softc *sc)
+{
+
+	return (sc->sc_connector == SFP_CONNECTOR_COPPER_PIGTAIL ?
+	    "DAC" : "fiber");
 }
 
 /*
@@ -621,27 +641,27 @@ sfp_phy_read_speed(struct sfp_fdt_softc *sc)
 	if (stat < 0 || !(stat & MDIO_AN_STAT1_COMPLETE))
 		return (0);
 
+	/* Highest rate both the partner and our PHY support (modes 0 = unknown) */
 	lpa10g = sfp_phy_read(sc, MDIO_MMD_AN, MDIO_AN_10GBT_STAT);
-	if (lpa10g >= 0) {
-		if (lpa10g & MDIO_AN_10GBT_STAT_LP10G)
-			return (10000);
-		if (lpa10g & MDIO_AN_10GBT_STAT_LP5G)
-			return (5000);
-		if (lpa10g & MDIO_AN_10GBT_STAT_LP2_5G)
-			return (2500);
-	}
+	if (lpa10g < 0)
+		return (0);
+	if ((lpa10g & MDIO_AN_10GBT_STAT_LP10G) &&
+	    (sc->sc_phy_modes == 0 || (sc->sc_phy_modes & SFP_MODE_10G_T)))
+		return (10000);
+	if ((lpa10g & MDIO_AN_10GBT_STAT_LP5G) &&
+	    (sc->sc_phy_modes == 0 || (sc->sc_phy_modes & SFP_MODE_5000_T)))
+		return (5000);
+	if ((lpa10g & MDIO_AN_10GBT_STAT_LP2_5G) &&
+	    (sc->sc_phy_modes == 0 || (sc->sc_phy_modes & SFP_MODE_2500_T)))
+		return (2500);
 
-	/* PMA/PMD CTRL1 speed select: bit 13=10G, bit 6=1G */
+	/* No shared multi-gig rate, so the link is 1G or 100M */
 	ctrl1 = sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_CTRL1);
-	if (ctrl1 >= 0) {
-		if (ctrl1 & (1 << 13))
-			return (10000);
-		if (ctrl1 & (1 << 6))
-			return (1000);
+	if (ctrl1 >= 0 &&
+	    (ctrl1 & MDIO_PMA_CTRL1_SPEEDSEL) == MDIO_PMA_CTRL1_SPEED100)
 		return (100);
-	}
 
-	return (0);
+	return (1000);
 }
 
 /*
@@ -685,6 +705,16 @@ sfp_fdt_notify_link_down(struct sfp_fdt_softc *sc)
 	if (sc->sc_upstream_ops != NULL &&
 	    sc->sc_upstream_ops->link_down != NULL)
 		sc->sc_upstream_ops->link_down(sc->sc_upstream_arg);
+}
+
+static void
+sfp_fdt_notify_phy_modes(struct sfp_fdt_softc *sc)
+{
+
+	if (sc->sc_upstream_ops != NULL &&
+	    sc->sc_upstream_ops->phy_modes != NULL)
+		sc->sc_upstream_ops->phy_modes(sc->sc_upstream_arg,
+		    sc->sc_phy_modes);
 }
 
 /*
@@ -829,6 +859,29 @@ sfp_fdt_sm_phy_probe(struct sfp_fdt_softc *sc)
 
 	extable = sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_PMA_EXTABLE);
 	if (extable >= 0) {
+		uint32_t modes = 0;
+
+		if (extable & MDIO_PMA_EXTABLE_10GBT)
+			modes |= SFP_MODE_10G_T;
+		if (extable & MDIO_PMA_EXTABLE_1000BT)
+			modes |= SFP_MODE_1000_T;
+		/* EXTABLE has one NBASE-T bit; register 1.21 splits 2.5G/5G. */
+		if (extable & MDIO_PMA_EXTABLE_NBT) {
+			int ngext = sfp_phy_read(sc, MDIO_MMD_PMAPMD,
+			    MDIO_PMA_NG_EXTABLE);
+
+			if (ngext >= 0 && (ngext &
+			    (MDIO_PMA_NG_EXTABLE_2_5GBT |
+			    MDIO_PMA_NG_EXTABLE_5GBT)) != 0) {
+				if (ngext & MDIO_PMA_NG_EXTABLE_2_5GBT)
+					modes |= SFP_MODE_2500_T;
+				if (ngext & MDIO_PMA_NG_EXTABLE_5GBT)
+					modes |= SFP_MODE_5000_T;
+			} else
+				modes |= SFP_MODE_2500_T | SFP_MODE_5000_T;
+		}
+		sc->sc_phy_modes = modes;
+
 		device_printf(sc->sc_dev,
 		    "SFP+ PHY abilities: %s%s%s\n",
 		    (extable & MDIO_PMA_EXTABLE_10GBT) ? "10GBASE-T " : "",
@@ -840,6 +893,8 @@ sfp_fdt_sm_phy_probe(struct sfp_fdt_softc *sc)
 	sc->sc_has_phy = true;
 	sc->sc_phy_link = false;
 	sc->sc_phy_speed = 0;
+
+	sfp_fdt_notify_phy_modes(sc);
 
 	sfp_phy_config_aneg(sc);
 
@@ -890,6 +945,8 @@ sfp_fdt_sm_phy_poll(struct sfp_fdt_softc *sc)
 			sc->sc_phy_speed = speed;
 			device_printf(sc->sc_dev,
 			    "SFP+ PHY: negotiated %d Mbps\n", speed);
+			/* Tell the MAC driver the speed it didn't get at link up */
+			sfp_fdt_notify_link_up(sc, speed);
 		}
 	}
 }
@@ -928,7 +985,8 @@ sfp_fdt_sm_wait_los(struct sfp_fdt_softc *sc)
 		if (!los) {
 			/* LOS clear = signal present = link up */
 			sc->sc_los_prev = false;
-			device_printf(sc->sc_dev, "SFP+ fiber: link up\n");
+			device_printf(sc->sc_dev, "SFP+ %s: link up\n",
+			    sfp_fdt_los_kind(sc));
 			sfp_fdt_notify_link_up(sc, 0);
 			sc->sc_state = SFP_ST_LINK_UP;
 		}
@@ -960,6 +1018,8 @@ sfp_fdt_sm_link_up(struct sfp_fdt_softc *sc)
 				sc->sc_phy_speed = speed;
 				device_printf(sc->sc_dev,
 				    "SFP+ PHY: negotiated %d Mbps\n", speed);
+				/* Tell the MAC driver the speed it didn't get */
+				sfp_fdt_notify_link_up(sc, speed);
 			}
 		}
 	} else if (sc->sc_connector == SFP_CONNECTOR_RJ45) {
@@ -978,7 +1038,8 @@ sfp_fdt_sm_link_up(struct sfp_fdt_softc *sc)
 		gpio_pin_is_active(sc->sc_los, &los);
 		if (los && !sc->sc_los_prev) {
 			sc->sc_los_prev = true;
-			device_printf(sc->sc_dev, "SFP+ fiber: link down\n");
+			device_printf(sc->sc_dev, "SFP+ %s: link down\n",
+			    sfp_fdt_los_kind(sc));
 			sfp_fdt_notify_link_down(sc);
 			sc->sc_state = SFP_ST_WAIT_LOS;
 		} else if (!los && sc->sc_los_prev) {
@@ -1015,6 +1076,7 @@ sfp_fdt_sm_remove(struct sfp_fdt_softc *sc)
 	sc->sc_phy_id = 0;
 	sc->sc_phy_link = false;
 	sc->sc_phy_speed = 0;
+	sc->sc_phy_modes = 0;
 	sc->sc_los_prev = true;
 	memset(sc->sc_id, 0, sizeof(sc->sc_id));
 

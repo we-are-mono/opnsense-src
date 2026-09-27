@@ -1449,7 +1449,7 @@ ehash_dump_muram_diag(void)
 		printf("fm_ehash: DDR bucket[0] (cached): "
 		    "%016lx %016lx\n", bkt[0], bkt[1]);
 		/* Writeback + invalidate to force re-read from DDR */
-		cpu_dcache_wbinv_range((vm_offset_t)ehash_first_table_base, 64);
+		cpu_dcache_wbinv_range((void *)ehash_first_table_base, 64);
 		printf("fm_ehash: DDR bucket[0] (after wbinv): "
 		    "%016lx %016lx\n", bkt[0], bkt[1]);
 	}

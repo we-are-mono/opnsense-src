@@ -114,6 +114,51 @@ dtsec_fdt_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+/*
+ * Find the 10G port's PCS on its internal MDIO bus, the same way Mono's
+ * Linux sfp-led driver does: the "xfi" entry of pcs-handle, falling back
+ * to the first pcs-handle or pcsphy-handle entry.
+ */
+static void
+dtsec_fdt_find_pcs(device_t dev, struct dtsec_softc *sc,
+    phandle_t enet_node)
+{
+	phandle_t *xrefs, pcs_node;
+	device_t mdio;
+	pcell_t addr;
+	ssize_t n;
+	int idx;
+
+	if (ofw_bus_find_string_index(enet_node, "pcs-handle-names", "xfi",
+	    &idx) != 0)
+		idx = 0;
+	n = OF_getencprop_alloc_multi(enet_node, "pcs-handle",
+	    sizeof(*xrefs), (void **)&xrefs);
+	if (n <= 0)
+		n = OF_getencprop_alloc_multi(enet_node, "pcsphy-handle",
+		    sizeof(*xrefs), (void **)&xrefs);
+	if (n <= 0)
+		return;
+	if (idx >= n) {
+		OF_prop_free(xrefs);
+		return;
+	}
+	pcs_node = OF_node_from_xref(xrefs[idx]);
+	OF_prop_free(xrefs);
+
+	if (!ofw_bus_node_status_okay(pcs_node) ||
+	    OF_getencprop(pcs_node, "reg", &addr, sizeof(addr)) <= 0)
+		return;
+	mdio = OF_device_from_xref(OF_xref_from_node(OF_parent(pcs_node)));
+	if (mdio == NULL || strcmp(device_get_name(mdio), "memac_mdio") != 0)
+		return;
+
+	sc->sc_pcs_mdio = mdio;
+	sc->sc_pcs_addr = addr;
+	device_printf(dev, "SFP link from PCS at %s addr %d\n",
+	    device_get_nameunit(mdio), sc->sc_pcs_addr);
+}
+
 static int
 dtsec_fdt_attach(device_t dev)
 {
@@ -121,6 +166,7 @@ dtsec_fdt_attach(device_t dev)
 	device_t phy_dev;
 	phandle_t enet_node, phy_node;
 	phandle_t fman_rxtx_node[2];
+	phandle_t sfp_xref;
 	char phy_type[16];
 	pcell_t fman_tx_cell, mac_id;
 	int rid;
@@ -157,8 +203,10 @@ dtsec_fdt_attach(device_t dev)
 	/* Get PHY address */
 	if (OF_getencprop(enet_node, "phy-handle", (void *)&phy_node,
 	    sizeof(phy_node)) <= 0) {
-		/* 10G ports may use managed="in-band-status" with no PHY */
-		if (sc->sc_eth_dev_type == ETH_10GSEC) {
+		/* SFP/SFP+ ports may use managed="in-band-status" with no PHY */
+		if (sc->sc_eth_dev_type == ETH_10GSEC ||
+		    OF_getencprop(enet_node, "sfp", &sfp_xref,
+		    sizeof(sfp_xref)) > 0) {
 			sc->sc_phy_addr = -1;
 			sc->sc_mdio = NULL;
 			goto skip_phy;
@@ -185,9 +233,8 @@ dtsec_fdt_attach(device_t dev)
 	sc->sc_mdio = phy_dev;
 skip_phy:
 
-	/* Register with SFP framework for 10G ports */
-	if (sc->sc_eth_dev_type == ETH_10GSEC) {
-		phandle_t sfp_xref;
+	/* Register with SFP framework for SFP ports */
+	if (true) {
 		device_t sfp_dev;
 
 		if (OF_getencprop(enet_node, "sfp", &sfp_xref,
@@ -199,6 +246,9 @@ skip_phy:
 
 				/* Keep I2C bus handle for sysctl diag */
 				SFF_GET_I2C_BUS(sfp_dev, &sc->sc_sfp_i2c);
+
+				/* Link state for fiber/DAC comes from the PCS */
+				dtsec_fdt_find_pcs(dev, sc, enet_node);
 
 				/* Register to receive module/link events */
 				SFF_REGISTER_UPSTREAM(sfp_dev,
@@ -227,6 +277,8 @@ skip_phy:
 
 	if (!strcmp(phy_type, "sgmii"))
 		sc->sc_mac_enet_mode = e_ENET_MODE_SGMII_1000;
+	else if (!strcmp(phy_type, "1000base-x"))
+		sc->sc_mac_enet_mode = e_ENET_MODE_SGMII_BASEX_1000;
 	else if (!strcmp(phy_type, "rgmii"))
 		sc->sc_mac_enet_mode = e_ENET_MODE_RGMII_1000;
 	else if (!strcmp(phy_type, "xgmii"))
@@ -249,8 +301,10 @@ skip_phy:
 	/* ncsw expects 0-based per-type MAC IDs: 0..5 for 1G, 0..1 for 10G.
 	 * FManV3 device trees use cell-index 0-5 for 1G MACs but 8-9 for
 	 * 10G MACs (hardware MEMAC slot numbering).  Remap to 0-based. */
-	if (sc->sc_eth_dev_type == ETH_10GSEC && mac_id >= 8)
+	if (mac_id >= 8) {
+		sc->sc_eth_dev_type = ETH_10GSEC;
 		sc->sc_eth_id = mac_id - 8;
+	}
 
 	/* Get RX/TX port handles */
 	if (OF_getencprop(enet_node, "fsl,fman-ports", (void *)fman_rxtx_node,

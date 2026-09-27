@@ -80,6 +80,8 @@
 
 #include <dev/sff/sfp_fdt.h>
 
+#include "memac_mdio.h"
+
 #define	DTSEC_MIN_FRAME_SIZE	64
 #define	DTSEC_MAX_FRAME_SIZE	9600
 
@@ -457,8 +459,9 @@ dtsec_if_enable_locked(struct dtsec_softc *sc)
 	 * are enabled via SIOCSIFFLAGS → dtsec_if_enable_locked()
 	 * without going through if_init(), so the tick never starts.
 	 * callout_reset is idempotent — safe to call if already running. */
-	if (sc->sc_mii != NULL)
-		callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
+	if (sc->sc_mii != NULL || sc->sc_pcs_mdio != NULL)
+		callout_reset(&sc->sc_tick_callout, DTSEC_TICK(sc),
+		    dtsec_if_tick, sc);
 
 	/* Refresh link state */
 	dtsec_miibus_statchg(sc->sc_dev);
@@ -527,6 +530,9 @@ dtsec_if_ioctl(if_t ifp, u_long command, caddr_t data)
 		if (sc->sc_mii != NULL)
 			error = ifmedia_ioctl(ifp, ifr,
 			    &sc->sc_mii->mii_media, command);
+		else if (sc->sc_sfp_dev != NULL)
+			error = ifmedia_ioctl(ifp, ifr, &sc->sc_ifmedia,
+			    command);
 		else
 			error = ENOTTY;
 		break;
@@ -564,6 +570,8 @@ dtsec_if_ioctl(if_t ifp, u_long command, caddr_t data)
 	return (error);
 }
 
+static void dtsec_sfp_pcs_poll(struct dtsec_softc *sc);
+
 static void
 dtsec_if_tick(void *arg)
 {
@@ -575,8 +583,9 @@ dtsec_if_tick(void *arg)
 
 	if (sc->sc_mii != NULL)
 		mii_tick(sc->sc_mii);
+	dtsec_sfp_pcs_poll(sc);
 
-	callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
+	callout_reset(&sc->sc_tick_callout, DTSEC_TICK(sc), dtsec_if_tick, sc);
 
 	DTSEC_UNLOCK(sc);
 }
@@ -608,7 +617,7 @@ dtsec_if_init_locked(struct dtsec_softc *sc)
 	}
 
 	/* Start MII polling / periodic diagnostics */
-	callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
+	callout_reset(&sc->sc_tick_callout, DTSEC_TICK(sc), dtsec_if_tick, sc);
 
 	if (if_getflags(sc->sc_ifnet) & IFF_UP) {
 		error = dtsec_if_enable_locked(sc);
@@ -670,6 +679,54 @@ dtsec_if_watchdog(if_t ifp)
  * @{
  */
 
+/* PCS registers (Clause 45 MMD 3), as read by Linux for the Lynx PCS */
+#define	DTSEC_PCS_MMD		3
+#define	DTSEC_PCS_STAT1		1
+#define	DTSEC_PCS_STAT1_LINK	(1 << 2)
+
+/*
+ * On a 10G port with a fiber or DAC module, link comes from the PCS,
+ * not the module's LOS pin: a passive DAC has no LOS, so otherwise a
+ * far-end pull is never seen and link-up is reported blindly.
+ */
+static bool
+dtsec_sfp_pcs_managed(struct dtsec_softc *sc)
+{
+
+	return (sc->sc_pcs_mdio != NULL && sc->sc_sfp_modpresent &&
+	    ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_10000 &&
+	    sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] != SFP_CONNECTOR_RJ45);
+}
+
+/* Called from the tick. */
+static void
+dtsec_sfp_pcs_poll(struct dtsec_softc *sc)
+{
+	int stat;
+	bool link;
+
+	if (!dtsec_sfp_pcs_managed(sc))
+		return;
+
+	/* Link status is latched low: the second read is the current state
+	 * (same as Mono's Linux sfp-led driver). */
+	stat = memac_mdio_read_c45(sc->sc_pcs_mdio, sc->sc_pcs_addr,
+	    DTSEC_PCS_MMD, DTSEC_PCS_STAT1);
+	if (stat >= 0 && stat != 0xffff)
+		stat = memac_mdio_read_c45(sc->sc_pcs_mdio, sc->sc_pcs_addr,
+		    DTSEC_PCS_MMD, DTSEC_PCS_STAT1);
+	if (stat < 0)
+		return;		/* try again next tick */
+	/* An unanswered read is all ones and must not count as link. */
+	link = stat != 0xffff && (stat & DTSEC_PCS_STAT1_LINK) != 0;
+
+	if (link == sc->sc_sfp_phy_link)
+		return;
+	sc->sc_sfp_phy_link = link;
+	if_link_state_change(sc->sc_ifnet,
+	    link ? LINK_STATE_UP : LINK_STATE_DOWN);
+}
+
 static void
 dtsec_sfp_trim(char *dst, const uint8_t *src, int len)
 {
@@ -681,6 +738,45 @@ dtsec_sfp_trim(char *dst, const uint8_t *src, int len)
 		dst[i] = '\0';
 }
 
+static void
+dtsec_sfp_set_media(struct dtsec_softc *sc)
+{
+	uint8_t conn;
+
+	if (sc->sc_sfp_dev == NULL || !sc->sc_ifmedia_ready)
+		return;
+
+	ifmedia_removeall(&sc->sc_ifmedia);
+
+	if (!sc->sc_sfp_modpresent) {
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_AUTO, 0, NULL);
+		ifmedia_set(&sc->sc_ifmedia, IFM_ETHER | IFM_AUTO);
+		return;
+	}
+
+	conn = sc->sc_sfp_id[SFP_CONNECTOR_OFFSET];
+	if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_1000) {
+		/* 1000BASE-X port (1G firmware): every module runs at 1G. */
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER |
+		    (conn == SFP_CONNECTOR_RJ45 ? IFM_1000_T : IFM_1000_SX),
+		    0, NULL);
+	} else if (conn == SFP_CONNECTOR_RJ45) {
+		/* Copper PHY (10GBASE-T) module. */
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_10G_T, 0, NULL);
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_5000_T, 0, NULL);
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_2500_T, 0, NULL);
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_1000_T, 0, NULL);
+	} else if (conn == SFP_CONNECTOR_LC) {
+		/* Optical module. */
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_10G_SR, 0, NULL);
+	} else {
+		/* Passive/active direct-attach copper (DAC) and others. */
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_10G_TWINAX, 0, NULL);
+	}
+	ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_AUTO, 0, NULL);
+	ifmedia_set(&sc->sc_ifmedia, IFM_ETHER | IFM_AUTO);
+}
+
 static int
 dtsec_sfp_module_insert(void *arg, const uint8_t *id, int id_len)
 {
@@ -688,6 +784,7 @@ dtsec_sfp_module_insert(void *arg, const uint8_t *id, int id_len)
 
 	memcpy(sc->sc_sfp_id, id, MIN((int)sizeof(sc->sc_sfp_id), id_len));
 	sc->sc_sfp_modpresent = true;
+	dtsec_sfp_set_media(sc);
 
 	return (0);	/* accept all modules */
 }
@@ -701,6 +798,13 @@ dtsec_sfp_module_remove(void *arg)
 	sc->sc_sfp_modpresent = false;
 	sc->sc_sfp_phy_link = false;
 	sc->sc_sfp_phy_speed = 0;
+	sc->sc_sfp_phy_modes = 0;
+	dtsec_sfp_set_media(sc);
+	/* Back to the port's own rate until the next module reports one */
+	if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_10000)
+		if_setbaudrate(sc->sc_ifnet, IF_Gbps(10ULL));
+	else
+		if_setbaudrate(sc->sc_ifnet, IF_Gbps(1ULL));
 	if_link_state_change(sc->sc_ifnet, LINK_STATE_UNKNOWN);
 }
 
@@ -709,8 +813,21 @@ dtsec_sfp_link_up(void *arg, int speed)
 {
 	struct dtsec_softc *sc = arg;
 
+	/* The PCS decides link for these; LOS can be wrong. */
+	if (dtsec_sfp_pcs_managed(sc))
+		return;
+
 	sc->sc_sfp_phy_link = true;
 	sc->sc_sfp_phy_speed = speed;
+
+	/* Report the real line rate once the module knows it */
+	if (speed > 0)
+		if_setbaudrate(sc->sc_ifnet, IF_Mbps(speed));
+
+	if (sc->sc_mach != NULL &&
+	    ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_1000)
+		FM_MAC_AdjustLink(sc->sc_mach, e_ENET_SPEED_1000, true);
+
 	if_link_state_change(sc->sc_ifnet, LINK_STATE_UP);
 }
 
@@ -719,9 +836,20 @@ dtsec_sfp_link_down(void *arg)
 {
 	struct dtsec_softc *sc = arg;
 
+	if (dtsec_sfp_pcs_managed(sc))
+		return;
+
 	sc->sc_sfp_phy_link = false;
 	sc->sc_sfp_phy_speed = 0;
 	if_link_state_change(sc->sc_ifnet, LINK_STATE_DOWN);
+}
+
+static void
+dtsec_sfp_phy_modes(void *arg, uint32_t modes)
+{
+	struct dtsec_softc *sc = arg;
+
+	sc->sc_sfp_phy_modes = modes;
 }
 
 const struct sfp_upstream_ops dtsec_sfp_ops = {
@@ -729,6 +857,7 @@ const struct sfp_upstream_ops dtsec_sfp_ops = {
 	.module_remove	= dtsec_sfp_module_remove,
 	.link_up	= dtsec_sfp_link_up,
 	.link_down	= dtsec_sfp_link_down,
+	.phy_modes	= dtsec_sfp_phy_modes,
 };
 /** @} */
 
@@ -772,10 +901,29 @@ dtsec_ifmedia_sts(if_t ifp, struct ifmediareq *ifmr)
 			case 5000:  ifmr->ifm_active |= IFM_5000_T; break;
 			case 2500:  ifmr->ifm_active |= IFM_2500_T; break;
 			case 1000:  ifmr->ifm_active |= IFM_1000_T; break;
-			default:    ifmr->ifm_active |= IFM_10G_T; break;
+			case 100:   ifmr->ifm_active |= IFM_100_TX; break;
+			default:
+				/* Speed not known yet: show the port's own rate */
+				if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) ==
+				    e_ENET_SPEED_1000)
+					ifmr->ifm_active |= IFM_1000_T;
+				else
+					ifmr->ifm_active |= IFM_10G_T;
+				break;
 			}
 		} else {
-			ifmr->ifm_active |= IFM_10G_SR;
+			/*
+			 * TODO: reporting is not yet complete for 1G nor 10G.
+			 */
+			if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) ==
+			    e_ENET_SPEED_1000)
+				ifmr->ifm_active |= IFM_1000_SX;
+			else if (sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] ==
+			    SFP_CONNECTOR_LC)
+				ifmr->ifm_active |= IFM_10G_SR;
+			else
+				/* DAC and other non-optical modules */
+				ifmr->ifm_active |= IFM_10G_TWINAX;
 		}
 		if (sc->sc_sfp_phy_link)
 			ifmr->ifm_status = IFM_AVALID | IFM_ACTIVE;
@@ -976,6 +1124,68 @@ dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 }
 
 static int
+dtsec_sfp_read_page(struct dtsec_softc *sc, uint8_t addr, uint8_t *buf, int len)
+{
+	struct iic_msg msgs[2];
+	uint8_t off;
+	int chunk, done, err;
+
+	/* Sequential reads in small chunks to respect controller limits. */
+	for (done = 0; done < len; done += chunk) {
+		chunk = MIN(32, len - done);
+		off = (uint8_t)done;
+		msgs[0].slave = addr << 1;
+		msgs[0].flags = IIC_M_WR;
+		msgs[0].len = 1;
+		msgs[0].buf = &off;
+		msgs[1].slave = addr << 1;
+		msgs[1].flags = IIC_M_RD;
+		msgs[1].len = chunk;
+		msgs[1].buf = buf + done;
+		err = iicbus_transfer(sc->sc_sfp_i2c, msgs, 2);
+		if (err != 0)
+			return (err);
+	}
+	return (0);
+}
+
+static int
+dtsec_sysctl_sfp_eeprom(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	static const char hexd[] = "0123456789abcdef";
+	uint8_t a0[256], a2[256];
+	char hex[2 * 512 + 1];
+	int i, err;
+
+	if (sc->sc_sfp_i2c == NULL || !sc->sc_sfp_modpresent)
+		return (sysctl_handle_string(oidp, "", 0, req));
+
+	memset(a0, 0, sizeof(a0));
+	memset(a2, 0, sizeof(a2));
+
+	err = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev, IIC_INTRWAIT);
+	if (err != 0)
+		return (sysctl_handle_string(oidp, "", 0, req));
+	err = dtsec_sfp_read_page(sc, 0x50, a0, sizeof(a0));
+	if (err == 0)
+		(void)dtsec_sfp_read_page(sc, 0x51, a2, sizeof(a2));
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+	if (err != 0)
+		return (sysctl_handle_string(oidp, "", 0, req));
+
+	for (i = 0; i < 256; i++) {
+		hex[2 * i]     = hexd[a0[i] >> 4];
+		hex[2 * i + 1] = hexd[a0[i] & 0xf];
+		hex[512 + 2 * i]     = hexd[a2[i] >> 4];
+		hex[512 + 2 * i + 1] = hexd[a2[i] & 0xf];
+	}
+	hex[1024] = '\0';
+
+	return (sysctl_handle_string(oidp, hex, sizeof(hex), req));
+}
+
+static int
 dtsec_sysctl_sfp_info(SYSCTL_HANDLER_ARGS)
 {
 	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
@@ -992,6 +1202,35 @@ dtsec_sysctl_sfp_info(SYSCTL_HANDLER_ARGS)
 		dtsec_sfp_trim(partnum, &sc->sc_sfp_id[SFP_PARTNUM_OFFSET],
 		    SFP_PARTNUM_LEN);
 		snprintf(buf, sizeof(buf), "%s %s", vendor, partnum);
+	}
+
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+static int
+dtsec_sysctl_sfp_phy_modes(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint32_t m = sc->sc_sfp_phy_modes;
+	char buf[64];
+	size_t len;
+
+	/* Ascending rate order; empty for fiber/DAC or no PHY. */
+	buf[0] = '\0';
+	if (sc->sc_sfp_modpresent && m != 0) {
+		if (m & SFP_MODE_100_T)
+			strlcat(buf, "100M, ", sizeof(buf));
+		if (m & SFP_MODE_1000_T)
+			strlcat(buf, "1G, ", sizeof(buf));
+		if (m & SFP_MODE_2500_T)
+			strlcat(buf, "2.5G, ", sizeof(buf));
+		if (m & SFP_MODE_5000_T)
+			strlcat(buf, "5G, ", sizeof(buf));
+		if (m & SFP_MODE_10G_T)
+			strlcat(buf, "10G, ", sizeof(buf));
+		len = strlen(buf);
+		if (len >= 2)			/* trim trailing ", " */
+			buf[len - 2] = '\0';
 	}
 
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
@@ -1170,13 +1409,18 @@ dtsec_attach(device_t dev)
 			return (error);
 		}
 		sc->sc_mii = device_get_softc(sc->sc_mii_dev);
+	} else if (sc->sc_sfp_dev != NULL) {
+		ifmedia_init(&sc->sc_ifmedia, 0, dtsec_ifmedia_upd,
+		    dtsec_ifmedia_sts);
+		sc->sc_ifmedia_ready = true;
+		dtsec_sfp_set_media(sc);
 	}
 
 	/* Attach to stack */
 	ether_ifattach(ifp, sc->sc_mac_addr);
 
 	/* Set baudrate */
-	if (sc->sc_eth_dev_type == ETH_10GSEC)
+	if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_10000)
 		if_setbaudrate(ifp, IF_Gbps(10ULL));
 	else
 		if_setbaudrate(ifp, IF_Gbps(1ULL));
@@ -1209,6 +1453,16 @@ dtsec_attach(device_t dev)
 			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 			    sc, 0, dtsec_sysctl_sfp_info, "A",
 			    "SFP+ module vendor and part number");
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "sfp_eeprom",
+			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_sfp_eeprom, "A",
+			    "SFP module EEPROM A0h+A2h (hex, 512 bytes)");
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "sfp_phy_modes",
+			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_sfp_phy_modes, "A",
+			    "SFP copper PHY supported rates (e.g. \"1G, 2.5G, 5G, 10G\")");
 		}
 	}
 
@@ -1223,6 +1477,11 @@ dtsec_detach(device_t dev)
 
 	sc = device_get_softc(dev);
 	ifp = sc->sc_ifnet;
+
+	if (sc->sc_ifmedia_ready) {
+		ifmedia_removeall(&sc->sc_ifmedia);
+		sc->sc_ifmedia_ready = false;
+	}
 
 	if (device_is_attached(dev)) {
 		ether_ifdetach(ifp);

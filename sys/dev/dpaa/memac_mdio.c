@@ -59,6 +59,7 @@
 #include <dev/ofw/ofw_bus_subr.h>
 
 #include "miibus_if.h"
+#include "memac_mdio.h"
 
 /*
  * MDIO registers at offset 0x30 from the MDIO controller base.
@@ -319,6 +320,56 @@ memac_mdio_writereg(device_t dev, int phy, int reg, int value)
 	MDIO_UNLOCK();
 
 	return (0);
+}
+
+/*
+ * Clause 45 MDIO read, used for the internal PCS of a 10G port.
+ * Same sequence as Linux xgmac_mdio_read_c45().  Returns the register
+ * value, or -1 on error.
+ */
+int
+memac_mdio_read_c45(device_t dev, int phy, int mmd, int reg)
+{
+	struct memac_mdio_softc *sc;
+	uint32_t cfg, ctl, data;
+	int timeout;
+
+	sc = device_get_softc(dev);
+
+	MDIO_LOCK();
+
+	cfg = memac_mdio_read(sc, MEMAC_MDIO_CFG);
+	cfg &= (MDIO_CFG_CLK_DIV_MASK | MDIO_CFG_HOLD_MASK);
+	memac_mdio_write(sc, MEMAC_MDIO_CFG, cfg | MDIO_CFG_ENC45);
+	if (memac_mdio_wait_free(sc) != 0)
+		goto fail;
+
+	/* Port address in bits [9:5], MMD in bits [4:0] */
+	ctl = ((phy & 0x1f) << MDIO_CTL_PHY_ADDR_SHIFT) | (mmd & 0x1f);
+	memac_mdio_write(sc, MEMAC_MDIO_CTRL, ctl);
+	memac_mdio_write(sc, MEMAC_MDIO_ADDR, reg & 0xffff);
+	if (memac_mdio_wait_free(sc) != 0)
+		goto fail;
+
+	memac_mdio_write(sc, MEMAC_MDIO_CTRL, ctl | MDIO_CTL_READ);
+	if (memac_mdio_wait_free(sc) != 0)
+		goto fail;
+
+	for (timeout = MDIO_TIMEOUT; timeout > 0; timeout--) {
+		data = memac_mdio_read(sc, MEMAC_MDIO_DATA);
+		if (!(data & MDIO_DATA_BSY))
+			break;
+		DELAY(1);
+	}
+	if (timeout <= 0 ||
+	    (memac_mdio_read(sc, MEMAC_MDIO_CFG) & MDIO_CFG_READ_ERR))
+		goto fail;
+
+	MDIO_UNLOCK();
+	return (data & 0xffff);
+fail:
+	MDIO_UNLOCK();
+	return (-1);
 }
 
 /* Probe before dtsec (BUS_PASS_SUPPORTDEV) so sc_mdio lookup succeeds */
