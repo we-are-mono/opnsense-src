@@ -49,7 +49,12 @@ typedef struct t_FmHcParams {
 
 
 t_Handle    FmHcConfigAndInit(t_FmHcParams *p_FmHcParams);
-void        FmHcFree(t_Handle h_FmHc);
+/* Stop new borrowers only when no frame is owned. A timeout permanently
+ * refuses teardown/reconfiguration: reset the board to recover PCD state. */
+t_Error     FmHcQuiesce(t_Handle h_FmHc);
+t_Error     FmHcFree(t_Handle h_FmHc);
+/* TRUE once a confirmation timed out; HC stays refused until a board reset. */
+bool        FmHcIsFailed(t_Handle h_FmHc);
 t_Error     FmHcSetFramesDataMemory(t_Handle h_FmHc,
                                     uint8_t  memId);
 t_Error     FmHcDumpRegs(t_Handle h_FmHc);

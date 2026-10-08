@@ -1020,6 +1020,11 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd)
     t_FmPcd                             *p_FmPcd =(t_FmPcd *)h_FmPcd;
     t_Error                             err = E_OK;
 
+    /* HC confirmations can still use this PCD and its resources. Refuse
+     * before any teardown, and prevent new frame borrowers once idle. */
+    if (p_FmPcd->h_Hc && (err = FmHcQuiesce(p_FmPcd->h_Hc)) != E_OK)
+        RETURN_ERROR(MINOR, err, ("HC still owned or timed out; reset required"));
+
     if (p_FmPcd->ipv6FrameIdAddr)
         FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, UINT_TO_PTR(p_FmPcd->ipv6FrameIdAddr));
 
@@ -1060,7 +1065,9 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd)
 
     if (p_FmPcd->h_Hc)
     {
-        FmHcFree(p_FmPcd->h_Hc);
+        err = FmHcFree(p_FmPcd->h_Hc);
+        if (err)
+            RETURN_ERROR(MINOR, err, NO_MSG);
         p_FmPcd->h_Hc = NULL;
     }
 

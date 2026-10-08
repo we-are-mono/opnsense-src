@@ -83,6 +83,9 @@
 #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
 
 #define HC_CMD_POOL_SIZE                    (INTG_MAX_NUM_OF_CORES)
+/* Preserve the Linux wrapper's former one-second confirmation allowance. */
+#define HC_CONFIRM_POLLS                    10000
+#define HC_CONFIRM_POLL_US                  100
 
 #define BUILD_FD(len)                     \
 do {                                      \
@@ -124,6 +127,13 @@ typedef struct t_HcFrame {
 #endif /* defined(__MWERKS__) && ... */
 
 
+typedef enum e_HcBufState {
+    e_HC_BUF_FREE,
+    e_HC_BUF_READY,       /* Borrowed by a command builder or confirmed caller. */
+    e_HC_BUF_IN_FLIGHT,   /* Hardware may access the frame; caller still owns it. */
+    e_HC_BUF_ORPHANED     /* Caller returned after timeout; confirmation owns it. */
+} e_HcBufState;
+
 typedef struct t_FmHc {
     t_Handle                    h_FmPcd;
     t_Handle                    h_HcPortDev;
@@ -134,10 +144,30 @@ typedef struct t_FmHc {
     uint32_t                    seqNum[HC_CMD_POOL_SIZE];   /* FIFO of seqNum to use when
                                                                taking buffer */
     uint32_t                    nextSeqNumLocation;         /* seqNum location in seqNum[] for next buffer */
-    volatile bool               enqueued[HC_CMD_POOL_SIZE]; /* HC is active - frame is enqueued
-                                                               and not confirmed yet */
+    t_Handle                    h_Spinlock;
+    e_HcBufState                bufState[HC_CMD_POOL_SIZE];
+    bool                        failed;       /* Ambiguous completion: reset required. */
+    bool                        quiescing;    /* No new borrowers during teardown. */
     t_HcFrame                   *p_Frm[HC_CMD_POOL_SIZE];
 } t_FmHc;
+
+static uint32_t HcLock(t_FmHc *p_FmHc)
+{
+    return XX_LockIntrSpinlock(p_FmHc->h_Spinlock);
+}
+
+static void HcUnlock(t_FmHc *p_FmHc, uint32_t flags)
+{
+    XX_UnlockIntrSpinlock(p_FmHc->h_Spinlock, flags);
+}
+
+/* Caller holds the HC lock. Both the borrower and hardware are finished. */
+static void ReturnBuf(t_FmHc *p_FmHc, uint32_t seqNum)
+{
+    ASSERT_COND(p_FmHc->nextSeqNumLocation);
+    p_FmHc->bufState[seqNum] = e_HC_BUF_FREE;
+    p_FmHc->seqNum[--p_FmHc->nextSeqNumLocation] = seqNum;
+}
 
 
 static t_Error FillBufPool(t_FmHc *p_FmHc)
@@ -165,6 +195,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
     for (i = 0; i < HC_CMD_POOL_SIZE; i++)
     {
         p_FmHc->seqNum[i] = i;
+        p_FmHc->bufState[i] = e_HC_BUF_FREE;
     }
     p_FmHc->nextSeqNumLocation = 0;
 
@@ -177,19 +208,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
 
     ASSERT_COND(p_FmHc);
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+    intFlags = HcLock(p_FmHc);
 
-    if (p_FmHc->nextSeqNumLocation == HC_CMD_POOL_SIZE)
+    if (p_FmHc->quiescing || p_FmHc->nextSeqNumLocation == HC_CMD_POOL_SIZE)
     {
         /* No more buffers */
-        FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+        HcUnlock(p_FmHc, intFlags);
         return NULL;
     }
 
     *p_SeqNum = p_FmHc->seqNum[p_FmHc->nextSeqNumLocation];
+    ASSERT_COND(p_FmHc->bufState[*p_SeqNum] == e_HC_BUF_FREE);
+    p_FmHc->bufState[*p_SeqNum] = e_HC_BUF_READY;
     p_FmHc->nextSeqNumLocation++;
 
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    HcUnlock(p_FmHc, intFlags);
     return p_FmHc->p_Frm[*p_SeqNum];
 }
 
@@ -197,45 +230,66 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
 {
     uint32_t    intFlags;
 
-    UNUSED(p_Buf);
-
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
-    ASSERT_COND(p_FmHc->nextSeqNumLocation);
-    p_FmHc->nextSeqNumLocation--;
-    p_FmHc->seqNum[p_FmHc->nextSeqNumLocation] = seqNum;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    intFlags = HcLock(p_FmHc);
+    ASSERT_COND(seqNum < HC_CMD_POOL_SIZE && p_Buf == p_FmHc->p_Frm[seqNum]);
+    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY ||
+                p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT);
+    if (p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT)
+        p_FmHc->bufState[seqNum] = e_HC_BUF_ORPHANED;
+    else
+        ReturnBuf(p_FmHc, seqNum);
+    HcUnlock(p_FmHc, intFlags);
 }
 
 static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum)
 {
     t_Error     err = E_OK;
     uint32_t    intFlags;
-    uint32_t    timeout=100;
+    uint32_t    timeout = HC_CONFIRM_POLLS;
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
-    ASSERT_COND(!p_FmHc->enqueued[seqNum]);
-    p_FmHc->enqueued[seqNum] = TRUE;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    intFlags = HcLock(p_FmHc);
+    if (p_FmHc->failed || p_FmHc->quiescing)
+    {
+        HcUnlock(p_FmHc, intFlags);
+        RETURN_ERROR(MINOR, E_INVALID_STATE, ("HC unavailable; reset required after timeout"));
+    }
+    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY);
+    p_FmHc->bufState[seqNum] = e_HC_BUF_IN_FLIGHT;
+    HcUnlock(p_FmHc, intFlags);
     DBG(TRACE, ("Send Hc, SeqNum %d, buff@0x%x, fd offset 0x%x",
                 seqNum,
                 DPAA_FD_GET_ADDR(p_FmFd),
                 DPAA_FD_GET_OFFSET(p_FmFd)));
     err = p_FmHc->f_QmEnqueue(p_FmHc->h_QmArg, (void *)p_FmFd);
     if (err)
-        RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
-
-    while (p_FmHc->enqueued[seqNum] && --timeout)
-        XX_UDelay(100);
-
-    if (!timeout)
     {
-        intFlags = FmPcdLock(p_FmHc->h_FmPcd);
-        p_FmHc->enqueued[seqNum] = FALSE;
-        FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
-        RETURN_ERROR(MINOR, E_TIMEOUT, ("HC Callback, timeout exceeded"));
+        /* Enqueue errors mean rejection, never an accepted-command timeout. */
+        intFlags = HcLock(p_FmHc);
+        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+        HcUnlock(p_FmHc, intFlags);
+        RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
     }
 
-    return err;
+    for (;;)
+    {
+        intFlags = HcLock(p_FmHc);
+        if (p_FmHc->bufState[seqNum] == e_HC_BUF_READY)
+        {
+            HcUnlock(p_FmHc, intFlags);
+            return E_OK;
+        }
+        if (!timeout--)
+        {
+            /* A late confirmation can reclaim the frame, but cannot repair
+             * caller software state. Do not reopen HC; recovery requires a
+             * board reset. */
+            p_FmHc->failed = TRUE;
+            HcUnlock(p_FmHc, intFlags);
+            RETURN_ERROR(MINOR, E_TIMEOUT, ("HC confirmation timed out; board reset required"));
+        }
+        HcUnlock(p_FmHc, intFlags);
+        XX_UDelay(HC_CONFIRM_POLL_US);
+    }
 }
 
 
@@ -257,6 +311,12 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     p_FmHc->f_QmEnqueue         = p_FmHcParams->params.f_QmEnqueue;
     p_FmHc->h_QmArg             = p_FmHcParams->params.h_QmArg;
     p_FmHc->dataMemId           = DEFAULT_dataMemId;
+    p_FmHc->h_Spinlock = XX_InitSpinlock();
+    if (!p_FmHc->h_Spinlock)
+    {
+        XX_Free(p_FmHc);
+        return NULL;
+    }
 
     err = FillBufPool(p_FmHc);
     if (err != E_OK)
@@ -284,7 +344,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     if (!p_FmHc->h_HcPortDev)
     {
         REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM HC port!"));
-        XX_Free(p_FmHc);
+        FmHcFree(p_FmHc);
         return NULL;
     }
 
@@ -318,13 +378,57 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     return (t_Handle)p_FmHc;
 }
 
-void FmHcFree(t_Handle h_FmHc)
+t_Error FmHcQuiesce(t_Handle h_FmHc)
+{
+    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
+    uint32_t flags;
+    t_Error err = E_OK;
+
+    if (!p_FmHc)
+        return E_OK;
+    flags = HcLock(p_FmHc);
+    if (p_FmHc->failed)
+        err = ERROR_CODE(E_INVALID_STATE);
+    else if (p_FmHc->nextSeqNumLocation)
+        err = ERROR_CODE(E_BUSY);
+    else
+        p_FmHc->quiescing = TRUE;
+    HcUnlock(p_FmHc, flags);
+    return err;
+}
+
+bool FmHcIsFailed(t_Handle h_FmHc)
+{
+    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
+    uint32_t flags;
+    bool failed;
+
+    if (!p_FmHc)
+        return FALSE;
+    flags = HcLock(p_FmHc);
+    failed = p_FmHc->failed;
+    HcUnlock(p_FmHc, flags);
+    return failed;
+}
+
+t_Error FmHcFree(t_Handle h_FmHc)
 {
     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
+    t_Error err;
     int     i;
 
     if (!p_FmHc)
-        return;
+        return E_OK;
+
+    err = FmHcQuiesce(p_FmHc);
+    if (err)
+        return err;
+    if (p_FmHc->h_HcPortDev)
+    {
+        err = FM_PORT_Free(p_FmHc->h_HcPortDev);
+        if (err)
+            return err;
+    }
 
     for (i=0; i<HC_CMD_POOL_SIZE; i++)
         if (p_FmHc->p_Frm[i])
@@ -332,10 +436,9 @@ void FmHcFree(t_Handle h_FmHc)
         else
             break;
 
-    if (p_FmHc->h_HcPortDev)
-        FM_PORT_Free(p_FmHc->h_HcPortDev);
-
+    XX_FreeSpinlock(p_FmHc->h_Spinlock);
     XX_Free(p_FmHc);
+    return E_OK;
 }
 
 /*****************************************************************************/
@@ -344,16 +447,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
 {
     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
     int     i;
+    t_Error err;
 
     SANITY_CHECK_RETURN_ERROR(p_FmHc, E_INVALID_HANDLE);
 
+    err = FmHcQuiesce(p_FmHc);
+    if (err)
+        return err;
     p_FmHc->dataMemId            = memId;
 
     for (i=0; i<HC_CMD_POOL_SIZE; i++)
         if (p_FmHc->p_Frm[i])
+        {
             XX_FreeSmart(p_FmHc->p_Frm[i]);
+            p_FmHc->p_Frm[i] = NULL;
+        }
 
-    return FillBufPool(p_FmHc);
+    err = FillBufPool(p_FmHc);
+    if (!err)
+    {
+        uint32_t flags = HcLock(p_FmHc);
+        p_FmHc->quiescing = FALSE;
+        HcUnlock(p_FmHc, flags);
+    }
+    return err;
 }
 
 void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
@@ -361,20 +478,27 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
     t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
     t_HcFrame   *p_HcFrame;
     uint32_t    intFlags;
+    uint32_t    seqNum;
 
     ASSERT_COND(p_FmHc);
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+    intFlags = HcLock(p_FmHc);
     p_HcFrame  = (t_HcFrame *)PTR_MOVE(DPAA_FD_GET_ADDR(p_Fd), DPAA_FD_GET_OFFSET(p_Fd));
 
-    DBG(TRACE, ("Hc Conf, SeqNum %d, FD@0x%x, fd offset 0x%x",
-                p_HcFrame->commandSequence, DPAA_FD_GET_ADDR(p_Fd), DPAA_FD_GET_OFFSET(p_Fd)));
-
-    if (!(p_FmHc->enqueued[p_HcFrame->commandSequence]))
+    /* Match an owned buffer before reading an untrusted sequence index. */
+    for (seqNum = 0; seqNum < HC_CMD_POOL_SIZE; seqNum++)
+        if (p_HcFrame == p_FmHc->p_Frm[seqNum])
+            break;
+    if (!p_HcFrame || seqNum == HC_CMD_POOL_SIZE ||
+        p_HcFrame->commandSequence != seqNum ||
+        (p_FmHc->bufState[seqNum] != e_HC_BUF_IN_FLIGHT &&
+         p_FmHc->bufState[seqNum] != e_HC_BUF_ORPHANED))
         REPORT_ERROR(MINOR, E_INVALID_FRAME, ("Not an Host-Command frame received!"));
+    else if (p_FmHc->bufState[seqNum] == e_HC_BUF_ORPHANED)
+        ReturnBuf(p_FmHc, seqNum);
     else
-        p_FmHc->enqueued[p_HcFrame->commandSequence] = FALSE;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+    HcUnlock(p_FmHc, intFlags);
 }
 
 t_Error FmHcPcdKgSetScheme(t_Handle                    h_FmHc,

@@ -31,6 +31,7 @@
 #include <sys/bus.h>
 #include <sys/rman.h>
 #include <sys/malloc.h>
+#include <sys/sysctl.h>
 
 #include <dev/fdt/simplebus.h>
 #include <dev/ofw/ofw_bus.h>
@@ -346,21 +347,48 @@ fman_hc_qm_enqueue(t_Handle h_arg, void *p_fd)
 {
 	struct fman_softc *sc;
 	t_DpaaFD *fd = (t_DpaaFD *)p_fd;
+	t_Error error;
 
 	sc = h_arg;
 
 	/* Byte-swap HC frame data for FMan big-endian DMA */
 	fman_hc_bswap_frame(DPAA_FD_GET_ADDR(fd), DPAA_FD_GET_LENGTH(fd));
 
-	return (qman_fqr_enqueue(sc->hc_tx_fqr, 0, fd));
+	error = qman_fqr_enqueue(sc->hc_tx_fqr, 0, fd);
+	if (error != E_OK) {
+		/* Rejection leaves ownership with the caller, in CPU byte order. */
+		fman_hc_bswap_frame(DPAA_FD_GET_ADDR(fd),
+		    DPAA_FD_GET_LENGTH(fd));
+	}
+
+	return (error);
 }
+
+static t_Handle fman_hc_handle;
+
+static SYSCTL_NODE(_hw, OID_AUTO, fman, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "FMan host commands");
+
+static int
+fman_hc_failed_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	int failed;
+
+	failed = FmHcIsFailed(fman_hc_handle) ? 1 : 0;
+	return (sysctl_handle_int(oidp, &failed, 0, req));
+}
+
+SYSCTL_PROC(_hw_fman, OID_AUTO, hc_failed,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    fman_hc_failed_sysctl, "I",
+    "1 after a host-command timeout; offload updates stop until reboot");
 
 /*
  * QMan receive callback for HC confirmation frames.
  *
  * FMan sends HC command completions on the confirmation FQ.  QMan
- * delivers them here; we forward to FM_PCD_HcTxConf() which clears
- * the "enqueued" flag in hc.c, unblocking the spinning EnQFrm().
+ * delivers them here; we forward to FM_PCD_HcTxConf(), which marks the
+ * frame confirmed in hc.c and unblocks the waiting EnQFrm().
  *
  * The HC frame data was byte-swapped before enqueue (for FMan BE DMA).
  * Swap it back to native byte order so FmHcTxConf can read fields
@@ -992,6 +1020,7 @@ fman_reinit_pcd_with_hc(device_t dev)
 	/* Wire HC into the existing PCD */
 	p_FmPcd = (t_FmPcd *)sc->pcd_handle;
 	p_FmPcd->h_Hc = hc_handle;
+	fman_hc_handle = hc_handle;
 
 	/* Enable advanced offload (requires HC + PCD disabled) */
 	error = FM_PCD_SetAdvancedOffloadSupport(sc->pcd_handle);
