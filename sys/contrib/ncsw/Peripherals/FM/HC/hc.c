@@ -83,6 +83,17 @@
 #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
 
 #define HC_CMD_POOL_SIZE                    (INTG_MAX_NUM_OF_CORES)
+/* Three seconds: in the field a confirmation has come back just over one second late. */
+#define HC_CONFIRM_POLLS                    30000
+#define HC_CONFIRM_POLL_US                  100
+/* Settable through hw.fman.hc_confirm_polls, to test or diagnose timeouts. */
+uint32_t fm_hc_confirm_polls = HC_CONFIRM_POLLS;
+/* After a sync times out, try another sync this long later, doubling up to
+ * the maximum while it keeps failing. */
+#define HC_PROBE_FIRST_MS                   10000
+#define HC_PROBE_MAX_MS                     300000
+/* Lost frames allowed before giving up until reboot, keeping buffers free. */
+#define HC_MAX_ORPHANS                      (HC_CMD_POOL_SIZE / 2)
 
 #define BUILD_FD(len)                     \
 do {                                      \
@@ -124,6 +135,13 @@ typedef struct t_HcFrame {
 #endif /* defined(__MWERKS__) && ... */
 
 
+typedef enum e_HcBufState {
+    e_HC_BUF_FREE,
+    e_HC_BUF_READY,       /* Borrowed by a command builder or confirmed caller. */
+    e_HC_BUF_IN_FLIGHT,   /* Hardware may access the frame; caller still owns it. */
+    e_HC_BUF_ORPHANED     /* Caller returned after timeout; confirmation owns it. */
+} e_HcBufState;
+
 typedef struct t_FmHc {
     t_Handle                    h_FmPcd;
     t_Handle                    h_HcPortDev;
@@ -134,10 +152,39 @@ typedef struct t_FmHc {
     uint32_t                    seqNum[HC_CMD_POOL_SIZE];   /* FIFO of seqNum to use when
                                                                taking buffer */
     uint32_t                    nextSeqNumLocation;         /* seqNum location in seqNum[] for next buffer */
-    volatile bool               enqueued[HC_CMD_POOL_SIZE]; /* HC is active - frame is enqueued
-                                                               and not confirmed yet */
+    t_Handle                    h_Spinlock;
+    e_HcBufState                bufState[HC_CMD_POOL_SIZE];
+    bool                        failed;       /* A command timed out; refusing commands. */
+    bool                        latched;      /* Failed until reboot. */
+    bool                        probing;      /* A sync is testing whether HC works again. */
+    bool                        quiescing;    /* No new borrowers during teardown. */
+    uint32_t                    refused;      /* Commands refused after a timeout. */
+    uint32_t                    orphans;      /* Timed-out frames not confirmed yet. */
+    uint32_t                    failedAt;     /* ms when the first command timed out. */
+    uint32_t                    nextProbe;    /* ms when the next sync may try again. */
+    uint32_t                    probeWait;    /* ms between tries. */
+    uint32_t                    recoveries;   /* Times HC worked again after a timeout. */
+    uint32_t                    timeouts;     /* Confirmation timeouts. */
     t_HcFrame                   *p_Frm[HC_CMD_POOL_SIZE];
 } t_FmHc;
+
+static uint32_t HcLock(t_FmHc *p_FmHc)
+{
+    return XX_LockIntrSpinlock(p_FmHc->h_Spinlock);
+}
+
+static void HcUnlock(t_FmHc *p_FmHc, uint32_t flags)
+{
+    XX_UnlockIntrSpinlock(p_FmHc->h_Spinlock, flags);
+}
+
+/* Caller holds the HC lock. Both the borrower and hardware are finished. */
+static void ReturnBuf(t_FmHc *p_FmHc, uint32_t seqNum)
+{
+    ASSERT_COND(p_FmHc->nextSeqNumLocation);
+    p_FmHc->bufState[seqNum] = e_HC_BUF_FREE;
+    p_FmHc->seqNum[--p_FmHc->nextSeqNumLocation] = seqNum;
+}
 
 
 static t_Error FillBufPool(t_FmHc *p_FmHc)
@@ -165,6 +212,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
     for (i = 0; i < HC_CMD_POOL_SIZE; i++)
     {
         p_FmHc->seqNum[i] = i;
+        p_FmHc->bufState[i] = e_HC_BUF_FREE;
     }
     p_FmHc->nextSeqNumLocation = 0;
 
@@ -177,19 +225,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
 
     ASSERT_COND(p_FmHc);
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+    intFlags = HcLock(p_FmHc);
 
-    if (p_FmHc->nextSeqNumLocation == HC_CMD_POOL_SIZE)
+    if (p_FmHc->quiescing || p_FmHc->nextSeqNumLocation == HC_CMD_POOL_SIZE)
     {
         /* No more buffers */
-        FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+        HcUnlock(p_FmHc, intFlags);
         return NULL;
     }
 
     *p_SeqNum = p_FmHc->seqNum[p_FmHc->nextSeqNumLocation];
+    ASSERT_COND(p_FmHc->bufState[*p_SeqNum] == e_HC_BUF_FREE);
+    p_FmHc->bufState[*p_SeqNum] = e_HC_BUF_READY;
     p_FmHc->nextSeqNumLocation++;
 
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    HcUnlock(p_FmHc, intFlags);
     return p_FmHc->p_Frm[*p_SeqNum];
 }
 
@@ -197,45 +247,141 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
 {
     uint32_t    intFlags;
 
-    UNUSED(p_Buf);
-
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
-    ASSERT_COND(p_FmHc->nextSeqNumLocation);
-    p_FmHc->nextSeqNumLocation--;
-    p_FmHc->seqNum[p_FmHc->nextSeqNumLocation] = seqNum;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    intFlags = HcLock(p_FmHc);
+    ASSERT_COND(seqNum < HC_CMD_POOL_SIZE && p_Buf == p_FmHc->p_Frm[seqNum]);
+    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY ||
+                p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT);
+    if (p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT)
+    {
+        p_FmHc->bufState[seqNum] = e_HC_BUF_ORPHANED;
+        p_FmHc->orphans++;
+    }
+    else
+        ReturnBuf(p_FmHc, seqNum);
+    HcUnlock(p_FmHc, intFlags);
 }
 
-static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum)
+/* True for 1, 10, 100, ... so a stream of the same error is logged sparingly. */
+static __inline__ bool LogThisCount(uint32_t n)
+{
+    while (n >= 10 && n % 10 == 0)
+        n /= 10;
+    return (n == 1);
+}
+
+/*
+ * A sync changes nothing, so after one times out a later sync can safely test
+ * whether HC works again; CDX keeps unsynced deletes until a sync succeeds.
+ * Any other command that times out leaves HC failed until reboot.
+ */
+static t_Error EnQFrmEx(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum,
+                        bool isSync)
 {
     t_Error     err = E_OK;
     uint32_t    intFlags;
-    uint32_t    timeout=100;
+    uint32_t    timeout = fm_hc_confirm_polls;
+    uint32_t    refused;
+    uint32_t    now = 0;
+    uint32_t    downMs;
+    uint32_t    n;
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
-    ASSERT_COND(!p_FmHc->enqueued[seqNum]);
-    p_FmHc->enqueued[seqNum] = TRUE;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    intFlags = HcLock(p_FmHc);
+    if (p_FmHc->failed)
+    {
+        now = XX_CurrentTime();
+        if (!isSync || p_FmHc->latched || p_FmHc->probing ||
+            (int32_t)(now - p_FmHc->nextProbe) < 0)
+        {
+            refused = ++p_FmHc->refused;
+            HcUnlock(p_FmHc, intFlags);
+            if (LogThisCount(refused))
+                RETURN_ERROR(MINOR, E_INVALID_STATE,
+                    ("HC unavailable after a timeout (%u commands refused)", refused));
+            return ERROR_CODE(E_INVALID_STATE);
+        }
+        p_FmHc->probing = TRUE;
+    }
+    if (p_FmHc->quiescing)
+    {
+        HcUnlock(p_FmHc, intFlags);
+        RETURN_ERROR(MINOR, E_INVALID_STATE, ("HC unavailable during teardown"));
+    }
+    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY);
+    p_FmHc->bufState[seqNum] = e_HC_BUF_IN_FLIGHT;
+    HcUnlock(p_FmHc, intFlags);
     DBG(TRACE, ("Send Hc, SeqNum %d, buff@0x%x, fd offset 0x%x",
                 seqNum,
                 DPAA_FD_GET_ADDR(p_FmFd),
                 DPAA_FD_GET_OFFSET(p_FmFd)));
     err = p_FmHc->f_QmEnqueue(p_FmHc->h_QmArg, (void *)p_FmFd);
     if (err)
-        RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
-
-    while (p_FmHc->enqueued[seqNum] && --timeout)
-        XX_UDelay(100);
-
-    if (!timeout)
     {
-        intFlags = FmPcdLock(p_FmHc->h_FmPcd);
-        p_FmHc->enqueued[seqNum] = FALSE;
-        FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
-        RETURN_ERROR(MINOR, E_TIMEOUT, ("HC Callback, timeout exceeded"));
+        /* Enqueue errors mean rejection, never an accepted-command timeout. */
+        intFlags = HcLock(p_FmHc);
+        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+        p_FmHc->probing = FALSE;
+        HcUnlock(p_FmHc, intFlags);
+        RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
     }
 
-    return err;
+    for (;;)
+    {
+        intFlags = HcLock(p_FmHc);
+        if (p_FmHc->bufState[seqNum] == e_HC_BUF_READY)
+        {
+            if (!p_FmHc->probing)
+            {
+                HcUnlock(p_FmHc, intFlags);
+                return E_OK;
+            }
+            p_FmHc->probing = FALSE;
+            p_FmHc->failed = FALSE;
+            n = ++p_FmHc->recoveries;
+            downMs = XX_CurrentTime() - p_FmHc->failedAt;
+            HcUnlock(p_FmHc, intFlags);
+            if (LogThisCount(n))
+                XX_Print("FM HC: host commands working again after %u ms (%u times)\n",
+                         downMs, n);
+            return E_OK;
+        }
+        if (!timeout--)
+        {
+            /* A late confirmation can reclaim the frame, but cannot repair
+             * the caller's software state, so only a sync may reopen HC. */
+            now = XX_CurrentTime();
+            if (p_FmHc->probing)
+            {
+                p_FmHc->probing = FALSE;
+                p_FmHc->probeWait = MIN(p_FmHc->probeWait * 2, HC_PROBE_MAX_MS);
+            }
+            else
+            {
+                p_FmHc->failed = TRUE;
+                p_FmHc->failedAt = now;
+                p_FmHc->probeWait = HC_PROBE_FIRST_MS;
+            }
+            p_FmHc->nextProbe = now + p_FmHc->probeWait;
+            if (!isSync || p_FmHc->orphans + 1 > HC_MAX_ORPHANS)
+                p_FmHc->latched = TRUE;
+            n = ++p_FmHc->timeouts;
+            if (p_FmHc->latched)
+            {
+                HcUnlock(p_FmHc, intFlags);
+                RETURN_ERROR(MINOR, E_TIMEOUT, ("HC confirmation timed out; board reset required"));
+            }
+            HcUnlock(p_FmHc, intFlags);
+            if (LogThisCount(n))
+                RETURN_ERROR(MINOR, E_TIMEOUT, ("HC confirmation timed out (%u times)", n));
+            return ERROR_CODE(E_TIMEOUT);
+        }
+        HcUnlock(p_FmHc, intFlags);
+        XX_UDelay(HC_CONFIRM_POLL_US);
+    }
+}
+
+static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum)
+{
+    return EnQFrmEx(p_FmHc, p_FmFd, seqNum, FALSE);
 }
 
 
@@ -257,6 +403,12 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     p_FmHc->f_QmEnqueue         = p_FmHcParams->params.f_QmEnqueue;
     p_FmHc->h_QmArg             = p_FmHcParams->params.h_QmArg;
     p_FmHc->dataMemId           = DEFAULT_dataMemId;
+    p_FmHc->h_Spinlock = XX_InitSpinlock();
+    if (!p_FmHc->h_Spinlock)
+    {
+        XX_Free(p_FmHc);
+        return NULL;
+    }
 
     err = FillBufPool(p_FmHc);
     if (err != E_OK)
@@ -284,7 +436,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     if (!p_FmHc->h_HcPortDev)
     {
         REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM HC port!"));
-        XX_Free(p_FmHc);
+        FmHcFree(p_FmHc);
         return NULL;
     }
 
@@ -318,13 +470,71 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     return (t_Handle)p_FmHc;
 }
 
-void FmHcFree(t_Handle h_FmHc)
+t_Error FmHcQuiesce(t_Handle h_FmHc)
+{
+    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
+    uint32_t flags;
+    t_Error err = E_OK;
+
+    if (!p_FmHc)
+        return E_OK;
+    flags = HcLock(p_FmHc);
+    if (p_FmHc->failed)
+        err = ERROR_CODE(E_INVALID_STATE);
+    else if (p_FmHc->nextSeqNumLocation)
+        err = ERROR_CODE(E_BUSY);
+    else
+        p_FmHc->quiescing = TRUE;
+    HcUnlock(p_FmHc, flags);
+    return err;
+}
+
+bool FmHcIsFailed(t_Handle h_FmHc)
+{
+    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
+    uint32_t flags;
+    bool failed;
+
+    if (!p_FmHc)
+        return FALSE;
+    flags = HcLock(p_FmHc);
+    failed = p_FmHc->failed;
+    HcUnlock(p_FmHc, flags);
+    return failed;
+}
+
+uint32_t FmHcRecoveries(t_Handle h_FmHc)
+{
+    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
+    uint32_t flags;
+    uint32_t n;
+
+    if (!p_FmHc)
+        return 0;
+    flags = HcLock(p_FmHc);
+    n = p_FmHc->recoveries;
+    HcUnlock(p_FmHc, flags);
+    return n;
+}
+
+t_Error FmHcFree(t_Handle h_FmHc)
 {
     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
+    t_Error err;
     int     i;
 
     if (!p_FmHc)
-        return;
+        return E_OK;
+
+    err = FmHcQuiesce(p_FmHc);
+    if (err)
+        return err;
+    if (p_FmHc->h_HcPortDev)
+    {
+        err = FM_PORT_Free(p_FmHc->h_HcPortDev);
+        if (err)
+            return err;
+    }
 
     for (i=0; i<HC_CMD_POOL_SIZE; i++)
         if (p_FmHc->p_Frm[i])
@@ -332,10 +542,9 @@ void FmHcFree(t_Handle h_FmHc)
         else
             break;
 
-    if (p_FmHc->h_HcPortDev)
-        FM_PORT_Free(p_FmHc->h_HcPortDev);
-
+    XX_FreeSpinlock(p_FmHc->h_Spinlock);
     XX_Free(p_FmHc);
+    return E_OK;
 }
 
 /*****************************************************************************/
@@ -344,16 +553,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
 {
     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
     int     i;
+    t_Error err;
 
     SANITY_CHECK_RETURN_ERROR(p_FmHc, E_INVALID_HANDLE);
 
+    err = FmHcQuiesce(p_FmHc);
+    if (err)
+        return err;
     p_FmHc->dataMemId            = memId;
 
     for (i=0; i<HC_CMD_POOL_SIZE; i++)
         if (p_FmHc->p_Frm[i])
+        {
             XX_FreeSmart(p_FmHc->p_Frm[i]);
+            p_FmHc->p_Frm[i] = NULL;
+        }
 
-    return FillBufPool(p_FmHc);
+    err = FillBufPool(p_FmHc);
+    if (!err)
+    {
+        uint32_t flags = HcLock(p_FmHc);
+        p_FmHc->quiescing = FALSE;
+        HcUnlock(p_FmHc, flags);
+    }
+    return err;
 }
 
 void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
@@ -361,20 +584,45 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
     t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
     t_HcFrame   *p_HcFrame;
     uint32_t    intFlags;
+    uint32_t    seqNum;
+    uint32_t    lateMs = 0xffffffff;
+    uint32_t    n = 0;
 
     ASSERT_COND(p_FmHc);
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+    intFlags = HcLock(p_FmHc);
     p_HcFrame  = (t_HcFrame *)PTR_MOVE(DPAA_FD_GET_ADDR(p_Fd), DPAA_FD_GET_OFFSET(p_Fd));
 
-    DBG(TRACE, ("Hc Conf, SeqNum %d, FD@0x%x, fd offset 0x%x",
-                p_HcFrame->commandSequence, DPAA_FD_GET_ADDR(p_Fd), DPAA_FD_GET_OFFSET(p_Fd)));
-
-    if (!(p_FmHc->enqueued[p_HcFrame->commandSequence]))
+    /* Match an owned buffer before reading an untrusted sequence index. */
+    for (seqNum = 0; seqNum < HC_CMD_POOL_SIZE; seqNum++)
+        if (p_HcFrame == p_FmHc->p_Frm[seqNum])
+            break;
+    if (!p_HcFrame || seqNum == HC_CMD_POOL_SIZE ||
+        p_HcFrame->commandSequence != seqNum ||
+        (p_FmHc->bufState[seqNum] != e_HC_BUF_IN_FLIGHT &&
+         p_FmHc->bufState[seqNum] != e_HC_BUF_ORPHANED))
         REPORT_ERROR(MINOR, E_INVALID_FRAME, ("Not an Host-Command frame received!"));
     else
-        p_FmHc->enqueued[p_HcFrame->commandSequence] = FALSE;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    {
+        if (p_FmHc->bufState[seqNum] == e_HC_BUF_ORPHANED)
+        {
+            ReturnBuf(p_FmHc, seqNum);
+            p_FmHc->orphans--;
+        }
+        else
+            p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+        /* A confirmation while failed means a command finished late. */
+        if (p_FmHc->failed && !p_FmHc->latched && !p_FmHc->probing)
+        {
+            p_FmHc->failed = FALSE;
+            n = ++p_FmHc->recoveries;
+            lateMs = XX_CurrentTime() - p_FmHc->failedAt;
+        }
+    }
+    HcUnlock(p_FmHc, intFlags);
+    if (lateMs != 0xffffffff && LogThisCount(n))
+        XX_Print("FM HC: late confirmation %u ms after the timeout, host commands working again (%u times)\n",
+                 lateMs, n);
 }
 
 t_Error FmHcPcdKgSetScheme(t_Handle                    h_FmHc,
@@ -1219,12 +1467,13 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
 
     BUILD_FD(sizeof(t_HcFrame));
 
-    err = EnQFrm(p_FmHc, &fmFd, seqNum);
+    err = EnQFrmEx(p_FmHc, &fmFd, seqNum, TRUE);
 
     PutBuf(p_FmHc, p_HcFrame, seqNum);
 
+    /* EnQFrm already logged it. */
     if (err != E_OK)
-        RETURN_ERROR(MINOR, err, NO_MSG);
+        return err;
 
     return E_OK;
 }

@@ -598,6 +598,13 @@ XX_UDelay(uint32_t usecs)
 	DELAY(usecs);
 }
 
+uint32_t
+XX_CurrentTime(void)
+{
+
+	return ((uint32_t)sbttoms(getsbinuptime()));
+}
+
 t_Error
 XX_IpcRegisterMsgHandler(char addr[XX_IPC_MAX_ADDR_NAME_LENGTH],
     t_IpcMsgHandler *f_MsgHandler, t_Handle  h_Module, uint32_t replyLength)

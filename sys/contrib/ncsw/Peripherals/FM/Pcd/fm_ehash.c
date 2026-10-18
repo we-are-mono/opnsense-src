@@ -930,8 +930,16 @@ ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
 	XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 
 	if (FmPcdHcSync(info->pcd)) {
-		printf("fm_ehash: FmPcdHcSync failed in DeleteKey\n");
-		return (-1);
+		static volatile u_int unsynced;
+		u_int n = atomic_fetchadd_int(&unsynced, 1) + 1;
+		u_int m = n;
+
+		/* Logged at 1, 10, 100, ... times; CDX counts every one. */
+		while (m >= 10 && m % 10 == 0)
+			m /= 10;
+		if (m == 1)
+			printf("fm_ehash: FmPcdHcSync failed in DeleteKey (%u times)\n", n);
+		return (EN_EHASH_DELETE_UNSYNCED);
 	}
 
 	return (0);
