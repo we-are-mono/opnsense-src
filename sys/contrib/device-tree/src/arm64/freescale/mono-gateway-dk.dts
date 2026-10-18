@@ -86,6 +86,8 @@
 &esdhc {
 	status = "okay";
 	mmc-hs200-1_8v;
+	/* LS1046A HS200 limit, as in Linux; at 175 MHz eMMC writes time out. */
+	max-frequency = <167000000>;
 	bus-width = <4>;
 };
 
