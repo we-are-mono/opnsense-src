@@ -654,6 +654,7 @@ struct pf_rule {
 /* was	PFSTATE_INP_UNLINKED	0x0400 */
 /* FreeBSD-specific flags are added from the end to keep space for porting
  * flags from OpenBSD */
+#define	PFSTATE_OFFLOAD_PIN	0x2000	/* in hardware offload, don't time out */
 #define	PFSTATE_DN_IS_PIPE	0x4000
 #define	PFSTATE_DN_IS_QUEUE	0x8000
 #define	PFSTATE_SCRUBMASK (PFSTATE_NODF|PFSTATE_RANDOMID|PFSTATE_SCRUB_TCP)

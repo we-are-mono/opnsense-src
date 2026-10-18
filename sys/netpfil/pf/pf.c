@@ -2785,6 +2785,10 @@ pf_state_expires(const struct pf_kstate *state)
 	timeout = state->rule->timeout[state->timeout];
 	if (!timeout)
 		timeout = V_pf_default_rule.timeout[state->timeout];
+	/* An offloaded flow's packets bypass pf, so the hardware decides when
+	 * it has gone idle and unpins it, like ASK's IPS_PERMANENT. */
+	if (state->state_flags & PFSTATE_OFFLOAD_PIN)
+		return (time_uptime + timeout);
 	start = state->rule->timeout[PFTM_ADAPTIVE_START];
 	if (start && state->rule != &V_pf_default_rule) {
 		end = state->rule->timeout[PFTM_ADAPTIVE_END];

@@ -858,6 +858,9 @@ pfsync_state_import(union pfsync_state_union *sp, int flags, int msg_version)
 			    __func__, msg_version);
 	}
 
+	/* A peer's offload pin means nothing here; nobody would unpin it. */
+	st->state_flags &= ~PFSTATE_OFFLOAD_PIN;
+
 	st->expire = pf_get_uptime();
 	if (sp->pfs_1301.expire) {
 		uint32_t timeout;
