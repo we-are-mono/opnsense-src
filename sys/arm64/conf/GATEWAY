@@ -21,6 +21,8 @@ nooptions	LOCK_PROFILING
 
 # OPNsense standard features (from SMP-ARM)
 options 	DDB
+# Restart 15 seconds after a panic instead of waiting at the db> prompt.
+options 	KDB_UNATTENDED
 options 	GEOM_BDE
 options 	GEOM_ELI
 options 	GEOM_MIRROR
