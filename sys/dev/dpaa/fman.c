@@ -312,6 +312,9 @@ fman_pcd_id_exception_callback(t_Handle app_handle,
 #define	FMAN_HC_OH_CELL_INDEX	0x02	/* DT cell-index for QMan channel */
 #define	FMAN_HC_LIODN_BASE	0	/* ARM64 SMMU handles LIODN */
 #define	FMAN_HC_FQ_WQ		1	/* Work queue priority */
+/* CPU0's own queue at top priority, so receive traffic can't hold back confirmations. */
+#define	FMAN_HC_CONF_CHANNEL	e_QM_FQ_CHANNEL_SWPORTAL0
+#define	FMAN_HC_CONF_WQ		0
 
 /*
  * Byte-swap every uint32_t in a buffer.
@@ -920,8 +923,8 @@ fman_reinit_pcd_with_hc(device_t dev)
 	sc->hc_tx_fqr = fqr;
 
 	/* Confirmation FQR — FMan sends HC completions here */
-	fqr = qman_fqr_create(1, e_QM_FQ_CHANNEL_POOL1,
-	    FMAN_HC_FQ_WQ, false, 0, false, false, true, false,
+	fqr = qman_fqr_create(1, FMAN_HC_CONF_CHANNEL,
+	    FMAN_HC_CONF_WQ, false, 0, false, false, true, false,
 	    0, 0, 0);
 	if (fqr == NULL) {
 		device_printf(dev, "couldn't create HC confirmation FQR\n");
@@ -945,8 +948,8 @@ fman_reinit_pcd_with_hc(device_t dev)
 	}
 
 	/* Error FQR — FMan sends HC errors here */
-	fqr = qman_fqr_create(1, e_QM_FQ_CHANNEL_POOL1,
-	    FMAN_HC_FQ_WQ, false, 0, false, false, true, false,
+	fqr = qman_fqr_create(1, FMAN_HC_CONF_CHANNEL,
+	    FMAN_HC_CONF_WQ, false, 0, false, false, true, false,
 	    0, 0, 0);
 	if (fqr == NULL) {
 		device_printf(dev, "couldn't create HC error FQR\n");
