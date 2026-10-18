@@ -40,6 +40,12 @@ options 	ZFS
 # Root filesystem (ZFS pool "pool0")
 options 	ROOTDEVNAME=\"zfs:pool0/ROOT/default\"
 
+# Official 26.1 images use ZFS, so try that root when UFS isn't there.
+options 	ZFS
+envvar		vfs.root.mountfrom="ufs:/dev/ufs/OPNsense_ARM zfs:pool0/ROOT/default"
+# Same as the official ZFS kernel, so its pool is found the same way.
+envvar		kern.geom.label.disk_ident.enable="0"
+
 # U-Boot (build booti compatible kernel)
 options 	LINUX_BOOT_ABI
 
